@@ -1077,6 +1077,9 @@ class _ParamAndGradBuffer:
                 pool,
                 group=self.data_parallel_group,
                 symmetric=not self.ddp_config.disable_symmetric_registration,
+                # disable_ddp_registration: allocate in the pool + remap, but do NOT
+                # ncclCommRegister on the DP group (register=False).
+                register=not self.ddp_config.disable_ddp_registration,
             )
             # Since nccl communicator group is created lazily, we need to perform a warmup call to
             # initialize NCCL comm buffers for this dp_group before doing buffer registration.
