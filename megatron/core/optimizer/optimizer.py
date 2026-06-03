@@ -48,7 +48,7 @@ from ..dist_checkpointing.optimizer import (
 )
 from ..dist_checkpointing.utils import add_prefix_for_sharding
 from ..transformer.module import param_is_not_shared
-from ..utils import log_single_rank
+from ..utils import log_single_rank, nvtx_range_push, nvtx_range_pop
 from .clip_grads import clip_grad_by_total_norm_fp32, count_zeros_fp32, get_grad_norm_fp32
 from .grad_scaler import MegatronGradScaler
 from .optimizer_config import OptimizerConfig
@@ -1509,14 +1509,19 @@ class ChainedOptimizer(MegatronOptimizer):
     @torch.no_grad()
     def step(self):
         """ChainedOptimizer will step all optimizers one by one."""
+        nvtx_range_push("opt/prepare_grads")
         found_inf_flag = self.prepare_grads()
+        nvtx_range_pop("opt/prepare_grads")
         if found_inf_flag:
             return False, None, None
 
+        nvtx_range_push("opt/grad_norm")
         grad_norm = self.get_grad_norm()
+        nvtx_range_pop("opt/grad_norm")
         should_skip_update = False
 
         # Clip gradients.
+        nvtx_range_push("opt/clip_grad")
         for optimizer in self.chained_optimizers:
             if hasattr(optimizer, 'is_stub_optimizer') and optimizer.is_stub_optimizer:
                 continue
@@ -1544,9 +1549,16 @@ class ChainedOptimizer(MegatronOptimizer):
                 )
                 should_skip_update = True
 
+        nvtx_range_pop("opt/clip_grad")
+
         # Count the zeros in the grads.
+        nvtx_range_push("opt/count_zeros")
         num_zeros_in_grad = self.count_zeros() if self.config.log_num_zeros_in_grad else None
+        nvtx_range_pop("opt/count_zeros")
+
+        nvtx_range_push("opt/step_with_ready_grads")
         update_successful = False if should_skip_update else self.step_with_ready_grads()
+        nvtx_range_pop("opt/step_with_ready_grads")
 
         return update_successful, grad_norm, num_zeros_in_grad
 

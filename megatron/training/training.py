@@ -170,6 +170,8 @@ from megatron.core.utils import (
     StragglerDetector,
     check_param_hashes_across_dp_replicas,
     configure_nvtx_profiling,
+    nvtx_range_pop,
+    nvtx_range_push,
     get_attr_wrapped_model,
     get_model_config,
     get_pg_rank,
@@ -2267,6 +2269,7 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
             enable_tokens_per_expert_logging(model, args.save)
         if save_dgrads_in_this_iteration:
             enable_dgrad_logging(model, args.save)
+        nvtx_range_push("fwd_bwd")
         losses_reduced = forward_backward_func(
             forward_step_func=forward_step_func,
             data_iterator=data_iterator,
@@ -2279,6 +2282,7 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
             adjust_tensor_shapes_fn=adjust_tensor_shapes_fn,
             force_all_reduce=save_wgrads_in_this_iteration,
         )
+        nvtx_range_pop("fwd_bwd")
         if save_activations_in_this_iteration:
             save_activations(iteration + 1)
             disable_activation_logging()
@@ -2327,7 +2331,9 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
     # Update parameters.
 
     timers('optimizer', log_level=1).start(barrier=args.barrier_with_L1_time)
+    nvtx_range_push("optimizer_step")
     update_successful, grad_norm, num_zeros_in_grad = optimizer.step()
+    nvtx_range_pop("optimizer_step")
 
     # get max attention logit for logging and run clip_qk()
     # Part of MuonClip Optimizer step

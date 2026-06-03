@@ -30,7 +30,13 @@ from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_layer import TransformerLayer
 from megatron.core.transformer.utils import sharded_state_dict_default
-from megatron.core.utils import WrappedTensor, deprecate_inference_params, make_viewless_tensor
+from megatron.core.utils import (
+    WrappedTensor,
+    deprecate_inference_params,
+    make_viewless_tensor,
+    nvtx_range_pop,
+    nvtx_range_push,
+)
 
 
 @dataclass
@@ -319,8 +325,9 @@ class HybridStack(MegatronModule):
                     use_inner_quantization_context=(use_inner_fp8_context or use_fp4_context),
                 )
             else:
-                for layer in self.layers:
+                for layer_type, layer in zip(self.layer_type_list, self.layers):
                     # Layers have 1-indexed layer numbers attribute.
+                    nvtx_range_push(msg=f"L{layer.layer_number}_{layer_type}")
                     inner_quant_context = get_inner_quant_context(
                         self.config, layer.layer_number - 1
                     )
@@ -348,6 +355,8 @@ class HybridStack(MegatronModule):
                     # for cross-attention, and is not needed in our model.
                     if isinstance(hidden_states, tuple):
                         hidden_states = hidden_states[0]
+
+                    nvtx_range_pop(msg=f"L{layer.layer_number}_{layer_type}")
 
         # Final layer norm.
         if self.post_process and self.post_layer_norm:
