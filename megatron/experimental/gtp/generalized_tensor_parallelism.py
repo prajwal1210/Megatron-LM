@@ -163,6 +163,9 @@ def classify_gtp_chains(model) -> None:
         if not isinstance(param, GTPShardedParam):
             continue
         target = _classify_param_chain(name).value
+        # Prefetch-list group is fixed by whether the weight is a routed expert
+        # (EGTP, IB-bound) vs dense (GTP, NVL-bound); it never conflicts on reclass.
+        param.chain_group = "egtp" if getattr(param, "is_routed_expert", False) else "gtp"
         if param.prefetch_initialized and param.chain_id != target:
             conflicts.append((name, param.chain_id, target))
             continue
@@ -438,6 +441,9 @@ def _gtp_attach_attrs(gtp_shard, gtp_group, *, is_grouped=False, expert_idx=0):
         # Default to UNGRAPHED; classify_gtp_chains() reclassifies based on the
         # cuda_graph_modules at init time.
         gtp_shard.chain_id = GTPChain.UNGRAPHED.value
+        # Routed-expert (EGTP) weights ride their own prefetch list (IB-bound at
+        # multi-NVL-domain scale), separate from the dense GTP (NVL) list.
+        gtp_shard.chain_group = "egtp"
     gtp_shard.group = gtp_group
     gtp_shard.gtp_size = gtp_group.size()
     # Two per-param symmetric-memory gates (dense vs expert via is_grouped):
@@ -566,31 +572,38 @@ class GTPShardedParam(torch.nn.Parameter):
     integrator needs to drive overlap with captured compute.
     """
 
-    # Per-chain state: each chain_id (GTPChain.GRAPHED / GTPChain.UNGRAPHED) has
-    # its own linked list. Chains never cross-link: prev_w/next_w only connect
-    # params with the same chain_id.
-    _chain_state: Dict[str, dict] = {}
+    # Per-chain state: each chain KEY (chain_id, chain_group) has its own linked
+    # list. The key combines the CG class (GTPChain.GRAPHED / UNGRAPHED) with the
+    # prefetch-list group ("gtp" / "egtp") so dense-GTP (NVL) and routed-expert-EGTP
+    # (IB) params form separate lists schedulable at independent prefetch depths.
+    # Chains never cross-link: prev_w/next_w only connect params with the same key.
+    _chain_state: Dict[tuple, dict] = {}
 
     # Per-chain cursor for the recompute-forward prefetch chain (see the _recompute_*
-    # slot on GTPShardedParam). Keyed by chain_id like _chain_state.
-    _recompute_chain_state: Dict[str, dict] = {}
+    # slot on GTPShardedParam). Keyed by chain key like _chain_state.
+    _recompute_chain_state: Dict[tuple, dict] = {}
+
+    @property
+    def _chain_key(self) -> tuple:
+        """Identity of this param's prefetch linked list: (chain_id, chain_group)."""
+        return (self.chain_id, getattr(self, "chain_group", "gtp"))
 
     @classmethod
-    def _get_chain_state(cls, chain_id: str) -> dict:
-        if chain_id not in cls._chain_state:
-            cls._chain_state[chain_id] = {
+    def _get_chain_state(cls, chain_key: tuple) -> dict:
+        if chain_key not in cls._chain_state:
+            cls._chain_state[chain_key] = {
                 "last_weight": None,
                 "link_node_count": 0,
                 "link_table_buffer": [],
                 "link_table_flushed": False,
             }
-        return cls._chain_state[chain_id]
+        return cls._chain_state[chain_key]
 
     @classmethod
-    def _get_recompute_chain_state(cls, chain_id: str) -> dict:
-        if chain_id not in cls._recompute_chain_state:
-            cls._recompute_chain_state[chain_id] = {"last_weight": None}
-        return cls._recompute_chain_state[chain_id]
+    def _get_recompute_chain_state(cls, chain_key: tuple) -> dict:
+        if chain_key not in cls._recompute_chain_state:
+            cls._recompute_chain_state[chain_key] = {"last_weight": None}
+        return cls._recompute_chain_state[chain_key]
 
     @classmethod
     def _buffer_link_table_row(
@@ -674,6 +687,12 @@ class GTPShardedParam(torch.nn.Parameter):
         # model at init time (after set_cuda_graph_modules) and reclassifies
         # based on param name + active cuda_graph_modules.
         self.chain_id = GTPChain.UNGRAPHED.value
+        # Prefetch-list group: "gtp" (dense, NVL-bound) vs "egtp" (routed-expert,
+        # IB-bound at multi-domain scale). Combined with chain_id into the chain
+        # key (_chain_key) so dense-GTP and routed-expert-EGTP params form SEPARATE
+        # prefetch linked lists and can be scheduled at independent depths. Set to
+        # "egtp" for routed experts in _gtp_attach_attrs; default "gtp" otherwise.
+        self.chain_group = "gtp"
         # Grouped gemm
         self.is_routed_expert = False
         self.expert_idx = None
@@ -1258,7 +1277,7 @@ class GTPShardedParam(torch.nn.Parameter):
         # recompute order). Consume/prefetch above used the prior iteration's links,
         # so the first backward runs on-demand while these links are established.
         if in_recompute and not self._recompute_initialized:
-            rchain = cls._get_recompute_chain_state(self.chain_id)
+            rchain = cls._get_recompute_chain_state(self._chain_key)
             last_r = rchain["last_weight"]
             if last_r is not None and last_r._recompute_next is None:
                 last_r._recompute_next = self
@@ -1267,8 +1286,8 @@ class GTPShardedParam(torch.nn.Parameter):
             rchain["last_weight"] = self
 
         # Lazy population of the fwd/bwd linked list: link previous weight to current.
-        # Uses per-chain state so dense and expert chains never cross-link.
-        chain = cls._get_chain_state(self.chain_id)
+        # Uses per-chain state so dense (GTP) and expert (EGTP) chains never cross-link.
+        chain = cls._get_chain_state(self._chain_key)
         if not self.prefetch_initialized:
             last_w = chain["last_weight"]
             if last_w is not None and last_w.next_w is None:
