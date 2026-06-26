@@ -602,6 +602,10 @@ def initialize_model_parallel(
     nccl_communicator_config_path: Optional[str] = None,
     distributed_timeout_minutes: int = 30,
     order: str = "tp-cp-ep-dp-pp",
+    gtp_order_anchor: str = "tp",
+    expert_gtp_order_anchor: str = "ep",
+    gtp_nvl_local: int = 0,
+    dp_nvl_local: int = 0,
     get_embedding_ranks: Optional[Callable[[List[int], Optional[int]], List[int]]] = None,
     get_position_embedding_ranks: Optional[Callable[[List[int], Optional[int]], List[int]]] = None,
     create_gloo_process_groups: bool = True,
@@ -712,6 +716,17 @@ def initialize_model_parallel(
         order (str, default=tp-dp-pp):
             The rank initialization order of parallelism. Now we support
             tp-dp-pp and tp-pp-dp orders.
+
+        gtp_order_anchor (str, default='tp'):
+            Order token after which the dense 'gtp' axis is injected. 'tp' (default) places
+            the GTP shard group on the most-local (contiguous) ranks. Set to e.g. 'dp' to
+            DECOUPLE GTP from a contiguous layout (strided placement) so the GTP shard group
+            no longer coincides with the innermost expert (EP) group, while EP stays in-domain.
+            GTP sharding uses the within-group rank, so any anchor is numerically equivalent;
+            the gtp-excluded replicate (no_gtp) groups re-derive consistently.
+
+        expert_gtp_order_anchor (str, default='ep'):
+            Like ``gtp_order_anchor`` but for the expert 'gtp' (EGTP) axis on the expert grid.
 
         get_embedding_ranks (Callable[[List[int], Optional[int]], List[int]], optional, default=None):
             A function that takes in a list of ranks for a pipeline group and returns
@@ -842,10 +857,17 @@ def initialize_model_parallel(
 
     # GTP is a real RankGenerator axis: inject 'gtp' into the order. Position controls NCCL
     # locality (leftmost token = smallest stride = most adjacent ranks):
-    #   - dense/decoder: inject after 'tp' → 'tp-gtp-cp-ep-dp-pp' (GTP gets local placement).
-    #   - expert: inject after 'ep' → 'tp-cp-ep-gtp-dp-pp' so EP keeps the more-local placement
-    #     than EGTP (the MoE EP all-to-all is the heavier expert-side collective).
-    # When gtp/egtp size is 1 the injected axis is a no-op (singleton groups).
+    #   - dense/decoder: inject after ``gtp_order_anchor`` (default 'tp' → 'tp-gtp-cp-ep-dp-pp',
+    #     GTP contiguous/local). Set e.g. 'dp' to DECOUPLE the GTP shard group from a contiguous
+    #     layout (strided placement), so GTP no longer coincides with the innermost EP group.
+    #   - expert: inject after ``expert_gtp_order_anchor`` (default 'ep' → 'tp-cp-ep-gtp-dp-pp')
+    #     so EP keeps the more-local placement than EGTP (the MoE EP all-to-all is the heavier
+    #     expert-side collective).
+    # GTP sharding keys off the WITHIN-GROUP rank, so any anchor yields a numerically-equivalent
+    # weight partition; the gtp-excluded replicate (no_gtp) groups re-derive consistently from the
+    # same generator. When gtp/egtp size is 1 the injected axis is a no-op (singleton groups).
+    # If an anchor isn't a token in `order`, _inject_gtp falls back to 'tp' (original behavior);
+    # the rank-0 GTP-placement log below shows the layout that actually resulted.
     def _inject_gtp(order_str: str, after: str = "tp") -> str:
         toks = order_str.split("-")
         if "gtp" in toks:
@@ -855,7 +877,7 @@ def initialize_model_parallel(
         toks.insert(pos, "gtp")
         return "-".join(toks)
 
-    decoder_order = _inject_gtp(order, after="tp")
+    decoder_order = _inject_gtp(order, after=gtp_order_anchor)
 
     decoder_rank_generator = RankGenerator(
         tp=tensor_model_parallel_size,
@@ -886,7 +908,7 @@ def initialize_model_parallel(
 
     # Expert grid: inject gtp AFTER 'ep' so EP outranks EGTP for NCCL locality (heavy MoE
     # all-to-all stays on the more-adjacent ranks; EGTP AG/RS takes the outer placement).
-    expert_order = _inject_gtp(order, after="ep")
+    expert_order = _inject_gtp(order, after=expert_gtp_order_anchor)
     expert_decoder_rank_generator = RankGenerator(
         tp=expert_tensor_parallel_size,
         ep=expert_model_parallel_size,
@@ -908,6 +930,75 @@ def initialize_model_parallel(
         "pp"
     ), f"Pipeline parallel groups are expected to be the same for Non-Expert and Expert part, \
     but got {decoder_rank_generator.get_ranks('pp')} and {expert_decoder_rank_generator.get_ranks('pp')}"
+
+    # ------------------------------------------------------------------------------------------
+    # GTP/DP 2D NVL tile (Phase B). When gtp_nvl_local and dp_nvl_local are both set, the GTP
+    # shard group and its gtp-excluded DP replicate group are carved as a 2D tile instead of
+    # along the single 'gtp' axis: each NVL domain (rack) holds gtp_nvl_local x dp_nvl_local
+    # GPUs (= EP, in-NVL), GTP spans gtp_ib racks (gtp_nvl_local per rack), DP spans dp_ib racks
+    # (dp_nvl_local per rack) — so BOTH groups keep an NVL-local chunk for symmetric kernels.
+    # Sharding/grad-reduce are within-group-rank, so any membership is numerically equivalent;
+    # the partition invariants (orthogonal, position-k replication) are asserted below.
+    _gtp_tile = gtp_nvl_local > 0 and dp_nvl_local > 0
+    tile_gtp_ranks = None
+    tile_dp_ranks = None
+    if _gtp_tile:
+        assert (
+            tensor_model_parallel_size == 1
+            and context_parallel_size == 1
+            and pipeline_model_parallel_size == 1
+        ), "GTP NVL tile currently requires TP=CP=PP=1"
+        assert num_distributed_optimizer_instances == 1, "GTP NVL tile requires 1 distopt instance"
+        assert gtp_remat_size % gtp_nvl_local == 0, (
+            f"gtp_remat_size ({gtp_remat_size}) must be divisible by gtp_nvl_local ({gtp_nvl_local})"
+        )
+        assert data_parallel_size % dp_nvl_local == 0, (
+            f"data_parallel_size ({data_parallel_size}) must be divisible by dp_nvl_local "
+            f"({dp_nvl_local})"
+        )
+        if expert_model_parallel_size > 1:
+            # With MoE, the rack (NVL domain) must equal EP so EP fills it and stays in-NVL.
+            # Dense models (EP=1) have no such constraint, so the tile is testable there.
+            assert gtp_nvl_local * dp_nvl_local == expert_model_parallel_size, (
+                f"NVL tile: gtp_nvl_local*dp_nvl_local ({gtp_nvl_local * dp_nvl_local}) must equal "
+                f"the NVL domain = EP ({expert_model_parallel_size}); EP fills the rack."
+            )
+
+        def _nvl_tile_rank_groups(gtp_nvl, dp_nvl, gtp_size, dp_size, offset):
+            """Carve GTP and gtp-excluded DP groups as a 16x4-style 2D NVL/IB tile.
+            rack = gtp_nvl*dp_nvl ; phys = rack_idx*rack + dp_nvl_idx*gtp_nvl + gtp_nvl_idx ;
+            rack_idx = gtp_ib_idx*dp_ib + dp_ib_idx ; within-GTP-group rank = gtp_ib_idx*gtp_nvl+gtp_nvl_idx."""
+            gtp_ib = gtp_size // gtp_nvl
+            dp_ib = dp_size // dp_nvl
+            rack = gtp_nvl * dp_nvl
+
+            def phys(gi, gn, di, dn):
+                return (gi * dp_ib + di) * rack + dn * gtp_nvl + gn + offset
+
+            gtp_groups = [
+                [phys(gi, gn, di, dn) for gi in range(gtp_ib) for gn in range(gtp_nvl)]
+                for di in range(dp_ib)
+                for dn in range(dp_nvl)
+            ]
+            dp_groups = [
+                [phys(gi, gn, di, dn) for di in range(dp_ib) for dn in range(dp_nvl)]
+                for gi in range(gtp_ib)
+                for gn in range(gtp_nvl)
+            ]
+            return gtp_groups, dp_groups
+
+        tile_gtp_ranks, tile_dp_ranks = _nvl_tile_rank_groups(
+            gtp_nvl_local, dp_nvl_local, gtp_remat_size, data_parallel_size, rank_offset
+        )
+        # Partition invariants (cheap defense; full proof in gtp_tile_roadmap.py).
+        base = rank_offset
+        span = gtp_remat_size * data_parallel_size
+        assert sorted(r for g in tile_gtp_ranks for r in g) == list(range(base, base + span)), (
+            "NVL tile GTP groups do not partition the data domain exactly once"
+        )
+        assert sorted(r for g in tile_dp_ranks for r in g) == list(range(base, base + span)), (
+            "NVL tile DP groups do not partition the data domain exactly once"
+        )
 
     timeout = timedelta(minutes=distributed_timeout_minutes)
 
@@ -939,7 +1030,10 @@ def initialize_model_parallel(
     assert (
         _GENERALIZED_TENSOR_PARALLEL_REMAT_GROUP is None
     ), "generalized tensor parallel group is already initialized"
-    for gtp_ranks in decoder_rank_generator.get_gtp_ranks(gtp_remat_size):
+    _gtp_rank_lists = (
+        tile_gtp_ranks if _gtp_tile else decoder_rank_generator.get_gtp_ranks(gtp_remat_size)
+    )
+    for gtp_ranks in _gtp_rank_lists:
         group = create_group(
             gtp_ranks,
             timeout=timeout,
@@ -949,6 +1043,24 @@ def initialize_model_parallel(
         if rank in gtp_ranks:
             _GENERALIZED_TENSOR_PARALLEL_REMAT_GROUP = group
             _GENERALIZED_TENSOR_PARALLEL_REMAT_GLOBAL_RANKS = gtp_ranks
+    if rank == 0 and gtp_remat_size > 1:
+        sample = _gtp_rank_lists[0]
+        if _gtp_tile:
+            logger.info(
+                "GTP placement (NVL tile gtp_nvl=%d dp_nvl=%d): sample shard group=%s "
+                "(16-style NVL-local x IB-racks)",
+                gtp_nvl_local,
+                dp_nvl_local,
+                sample,
+            )
+        else:
+            contiguous = sample == list(range(sample[0], sample[0] + len(sample)))
+            logger.info(
+                "GTP placement (anchor=%s): sample shard group=%s (%s)",
+                gtp_order_anchor,
+                sample,
+                "contiguous" if contiguous else "DECOUPLED/strided",
+            )
 
     # Tokens for the FULL (gtp-inclusive) data-parallel domain. gtp is factored out of the
     # generator's 'dp' axis, so the full data domain spans gtp explicitly ('gtp-dp'). The
@@ -1082,7 +1194,11 @@ def initialize_model_parallel(
         # The replicate (gtp-excluded) DP groups ARE get_ranks('dp') / get_ranks('dp-cp') by
         # construction (gtp is its own axis). Every rank iterates all groups so each create_group
         # collective is entered by all ranks.
-        for dp_ranks in decoder_rank_generator.get_ranks('dp'):
+        # NVL tile: the gtp-excluded replicate group is the tile's DP complement (4-local x
+        # dp_ib racks); otherwise it's get_ranks('dp') (gtp is its own axis). CP=1 in tile mode
+        # so 'dp' and 'dp-cp' share the same lists.
+        _no_gtp_dp_lists = tile_dp_ranks if _gtp_tile else decoder_rank_generator.get_ranks('dp')
+        for dp_ranks in _no_gtp_dp_lists:
             group = create_group(
                 dp_ranks,
                 timeout=timeout,
@@ -1092,7 +1208,10 @@ def initialize_model_parallel(
             if rank in dp_ranks:
                 _DATA_PARALLEL_GROUP_NO_GTP = group
 
-        for dp_cp_ranks in decoder_rank_generator.get_ranks('dp-cp'):
+        _no_gtp_dp_cp_lists = (
+            tile_dp_ranks if _gtp_tile else decoder_rank_generator.get_ranks('dp-cp')
+        )
+        for dp_cp_ranks in _no_gtp_dp_cp_lists:
             group = create_group(
                 dp_cp_ranks,
                 timeout=timeout,

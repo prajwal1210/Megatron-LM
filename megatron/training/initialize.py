@@ -369,6 +369,16 @@ def _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks, s
                 distributed_timeout_minutes=args.distributed_timeout_minutes,
                 nccl_communicator_config_path=args.nccl_communicator_config_path,
                 order='tp-cp-ep-dp-pp' if not args.use_tp_pp_dp_mapping else 'tp-cp-ep-pp-dp',
+                # GTP/EGTP placement anchor via env bridge (matches the GTP_PREFETCH_DEPTH idiom).
+                # GTP_ORDER_ANCHOR='dp' decouples the dense GTP shard group from the contiguous,
+                # EP-coincident layout into a strided / cross-NVL placement. Default 'tp'/'ep'
+                # reproduce the original contiguous placement.
+                gtp_order_anchor=os.environ.get("GTP_ORDER_ANCHOR", "tp"),
+                expert_gtp_order_anchor=os.environ.get("EXPERT_GTP_ORDER_ANCHOR", "ep"),
+                # 2D NVL/IB tile (Phase B): when both >0, GTP and its DP replicate complement
+                # are carved as a gtp_nvl x dp_nvl per-rack tile (e.g. 16x4). Default 0 = off.
+                gtp_nvl_local=int(os.environ.get("GTP_NVL_LOCAL", "0")),
+                dp_nvl_local=int(os.environ.get("DP_NVL_LOCAL", "0")),
                 get_embedding_ranks=get_embedding_ranks,
                 get_position_embedding_ranks=get_position_embedding_ranks,
                 create_gloo_process_groups=args.use_gloo_process_groups,
