@@ -479,6 +479,13 @@ def wrap_module_params_gtp(module, weight_names, gtp_group, is_grouped=None):
     # (dense) / .egtp_nccl_ub (expert). Idempotent across modules sharing a group.
     if (GTP_CONFIG.egtp_nccl_ub if is_grouped else GTP_CONFIG.gtp_nccl_ub):
         register_gtp_pool(gtp_group)
+        # Also register the shadow RS comm's pool — keyed by THIS gtp_group (not
+        # is_routed_expert) so the RS wgrad/recv buffers window-register on the comm that
+        # actually runs the reduce-scatter. Falls back to gtp_group when there is no shadow
+        # (custom group, or GTP_DECOUPLE_AGRS off) → idempotent.
+        from megatron.core import parallel_state as _ps
+
+        register_gtp_pool(_ps.get_gtp_rs_shadow_group(gtp_group))
 
     for idx, name in enumerate(weight_names):
         param = getattr(module, name, None)
@@ -1340,11 +1347,23 @@ class GTPShardedParam(torch.nn.Parameter):
         return self.all_gather_and_prefetch(**kwargs)
 
     @property
+    def rs_group(self):
+        """Communicator for the backward reduce-scatter, derived from THIS param's own
+        ``self.group``: with GTP_DECOUPLE_AGRS on it is the shadow comm registered for that
+        exact group (same ranks + rank order); otherwise — a custom / manually-supplied group
+        with no shadow, or the knob off — it falls back to ``self.group`` (byte-identical to
+        today). Keying on the actual group (not is_routed_expert + global state) is what keeps
+        custom ProcessGroupCollection / manually-supplied GTP groups correct."""
+        from megatron.core import parallel_state as _ps
+
+        return _ps.get_gtp_rs_shadow_group(self.group)
+
+    @property
     def _symm_rs_eligible(self) -> bool:
         """Whether this param's reduce-scatter send buffer should be symm-mem."""
         return (
-            self.group is not None
-            and self.group.size() > 1
+            self.rs_group is not None
+            and self.rs_group.size() > 1
             and getattr(self, "gtp_smr", False)
         )
 
@@ -1360,7 +1379,7 @@ class GTPShardedParam(torch.nn.Parameter):
             return _wgrad_pool_get(self._unsharded_shape, self.main_grad.dtype, self.device)
         if self._wgrad_padded_buf is None:
             self._wgrad_padded_buf = _gtp_wgrad_pool.alloc(
-                self._unsharded_shape_padded, self.main_grad.dtype, self.device, self.group
+                self._unsharded_shape_padded, self.main_grad.dtype, self.device, self.rs_group
             )
         return self._wgrad_padded_buf[: self._unsharded_shape[0]]
 
@@ -1499,7 +1518,7 @@ class GTPShardedParam(torch.nn.Parameter):
             if len(wgrads) == 1:
                 nvtx_range_push(f"{nvtx_label}.gtp_rs")
                 out, handle = reduce_scatter_along_first_dim(
-                    wgrads[0], self.group, async_op=async_op, output=out_buffers[0]
+                    wgrads[0], self.rs_group, async_op=async_op, output=out_buffers[0]
                 )
                 nvtx_range_pop(f"{nvtx_label}.gtp_rs")
                 return [out], handle
@@ -1507,10 +1526,10 @@ class GTPShardedParam(torch.nn.Parameter):
             outputs = []
             nvtx_range_push(f"{nvtx_label}.batched_gtp_rs")
             with torch.distributed._coalescing_manager(
-                group=self.group, device=wgrads[0].device, async_ops=async_op
+                group=self.rs_group, device=wgrads[0].device, async_ops=async_op
             ) as cm:
                 for out_buffer, tensor in zip(out_buffers, wgrads):
-                    out, _ = reduce_scatter_along_first_dim(tensor, self.group, output=out_buffer)
+                    out, _ = reduce_scatter_along_first_dim(tensor, self.rs_group, output=out_buffer)
                     outputs.append(out)
             nvtx_range_pop(f"{nvtx_label}.batched_gtp_rs")
 
@@ -1738,7 +1757,10 @@ class GTPWeightCache:
         # needed for symm buffers.  Non-symm GRAPHED buffers fall back to
         # _graphed_alloc (routes into _CG_MEMPOOL for replay stability).
         # Gated per-param by the stamped gtp_smr attribute.
-        group = getattr(param, "group", None)
+        # RS output buffers go in the RS comm's pool (rs_group) so the reduce-scatter
+        # is window-registered on the comm that runs it; AG output buffers stay on the
+        # main group. rs_group falls back to group when GTP_DECOUPLE_AGRS is off.
+        group = getattr(param, "rs_group" if reduce_scatter else "group", None)
         if (
             group is not None
             and group.size() > 1

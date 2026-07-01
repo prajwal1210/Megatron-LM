@@ -30,6 +30,12 @@ _TENSOR_MODEL_PARALLEL_GROUP = None
 # Generalized tensor parallelism group that the current rank belongs to.
 _GENERALIZED_TENSOR_PARALLEL_REMAT_GROUP = None
 _GENERALIZED_TENSOR_PARALLEL_REMAT_GLOBAL_RANKS = None
+# Shadow duplicate of the GTP remat group (same ranks + rank ORDER as the main group, its
+# own NCCL comm) used ONLY for the backward reduce-scatter, so it runs on a separate stream
+# and can overlap the all-gather. Selected by IDENTITY against the main group in
+# get_gtp_rs_shadow_group, so custom / manually-supplied groups fall back to self.group.
+# Created only when GTP_DECOUPLE_AGRS=1; otherwise None.
+_GENERALIZED_TENSOR_PARALLEL_REMAT_RS_GROUP = None
 # Inter-layer model parallel group that the current rank belongs to.
 _PIPELINE_MODEL_PARALLEL_GROUP = None
 # Model parallel group (both intra- and pipeline) that the current rank belongs to.
@@ -56,6 +62,8 @@ _TENSOR_AND_DATA_PARALLEL_GROUP = None
 # Expert generalized tensor parallelism group that current rank belongs to.
 _EXPERT_GENERALIZED_TENSOR_PARALLEL_REMAT_GROUP = None
 _EXPERT_GENERALIZED_TENSOR_PARALLEL_REMAT_GLOBAL_RANKS = None
+# Shadow RS comm for the expert (EGTP) remat group. See the dense variant above.
+_EXPERT_GENERALIZED_TENSOR_PARALLEL_REMAT_RS_GROUP = None
 # Expert model parallel group that current rank belongs to.
 _EXPERT_MODEL_PARALLEL_GROUP = None
 # Expert tensor parallel group that current rank belongs to.
@@ -936,9 +944,11 @@ def initialize_model_parallel(
     # while CP only shards activations — they are independent and can share ranks.
     global _GENERALIZED_TENSOR_PARALLEL_REMAT_GROUP
     global _GENERALIZED_TENSOR_PARALLEL_REMAT_GLOBAL_RANKS
+    global _GENERALIZED_TENSOR_PARALLEL_REMAT_RS_GROUP
     assert (
         _GENERALIZED_TENSOR_PARALLEL_REMAT_GROUP is None
     ), "generalized tensor parallel group is already initialized"
+    _decouple_ag_rs = os.environ.get("GTP_DECOUPLE_AGRS", "0") == "1"
     for gtp_ranks in decoder_rank_generator.get_gtp_ranks(gtp_remat_size):
         group = create_group(
             gtp_ranks,
@@ -946,9 +956,24 @@ def initialize_model_parallel(
             pg_options=get_nccl_options("gtp", nccl_comm_cfgs),
             group_desc="GENERALIZED_TENSOR_PARALLEL_REMAT_GROUP",
         )
+        # Shadow RS comm: same ranks, a separate NCCL communicator (reusing the gtp
+        # high-priority nccl opts) so the backward reduce-scatter overlaps the
+        # all-gather. create_group is collective, so every rank builds it for every
+        # rank-set inside the loop, exactly like the main group above.
+        rs_group = (
+            create_group(
+                gtp_ranks,
+                timeout=timeout,
+                pg_options=get_nccl_options("gtp", nccl_comm_cfgs),
+                group_desc="GENERALIZED_TENSOR_PARALLEL_REMAT_RS_GROUP",
+            )
+            if _decouple_ag_rs
+            else None
+        )
         if rank in gtp_ranks:
             _GENERALIZED_TENSOR_PARALLEL_REMAT_GROUP = group
             _GENERALIZED_TENSOR_PARALLEL_REMAT_GLOBAL_RANKS = gtp_ranks
+            _GENERALIZED_TENSOR_PARALLEL_REMAT_RS_GROUP = rs_group
 
     # Tokens for the FULL (gtp-inclusive) data-parallel domain. gtp is factored out of the
     # generator's 'dp' axis, so the full data domain spans gtp explicitly ('gtp-dp'). The
@@ -1335,9 +1360,11 @@ def initialize_model_parallel(
     # Expert GTP overlaps with the expert DP domain (experts don't use CP).
     global _EXPERT_GENERALIZED_TENSOR_PARALLEL_REMAT_GROUP
     global _EXPERT_GENERALIZED_TENSOR_PARALLEL_REMAT_GLOBAL_RANKS
+    global _EXPERT_GENERALIZED_TENSOR_PARALLEL_REMAT_RS_GROUP
     assert (
         _EXPERT_GENERALIZED_TENSOR_PARALLEL_REMAT_GROUP is None
     ), 'Expert generalized tensor parallel group is already initialized'
+    _decouple_ag_rs = os.environ.get("GTP_DECOUPLE_AGRS", "0") == "1"
     # EGTP shard groups are get_ranks('gtp') on the expert generator (singletons when
     # expert_gtp_remat_size == 1). See RankGenerator.get_gtp_ranks.
     for egtp_ranks in expert_decoder_rank_generator.get_gtp_ranks(expert_gtp_remat_size):
@@ -1347,9 +1374,21 @@ def initialize_model_parallel(
             pg_options=get_nccl_options("expt_gtp", nccl_comm_cfgs),
             group_desc="EXPERT_GENERALIZED_TENSOR_PARALLEL_REMAT_GROUP",
         )
+        # Shadow RS comm for EGTP (same ranks, own comm). See the dense group above.
+        rs_group = (
+            create_group(
+                egtp_ranks,
+                timeout=timeout,
+                pg_options=get_nccl_options("expt_gtp", nccl_comm_cfgs),
+                group_desc="EXPERT_GENERALIZED_TENSOR_PARALLEL_REMAT_RS_GROUP",
+            )
+            if _decouple_ag_rs
+            else None
+        )
         if rank in egtp_ranks:
             _EXPERT_GENERALIZED_TENSOR_PARALLEL_REMAT_GROUP = group
             _EXPERT_GENERALIZED_TENSOR_PARALLEL_REMAT_GLOBAL_RANKS = egtp_ranks
+            _EXPERT_GENERALIZED_TENSOR_PARALLEL_REMAT_RS_GROUP = rs_group
 
     # Build the expert model parallel group
     global _EXPERT_MODEL_PARALLEL_GROUP, _EXPERT_MODEL_PARALLEL_RANKS
@@ -1705,6 +1744,21 @@ def get_generalized_tensor_parallel_remat_group(check_initialized=True):
             _GENERALIZED_TENSOR_PARALLEL_REMAT_GROUP is not None
         ), "generalized tensor parallel group is not initialized"
     return _GENERALIZED_TENSOR_PARALLEL_REMAT_GROUP
+
+
+def get_gtp_rs_shadow_group(group):
+    """Return the shadow reduce-scatter communicator for a GTP/EGTP ``group`` — same ranks and
+    rank ORDER as ``group`` (built from the same rank list), on its own NCCL comm so the
+    backward RS can overlap the all-gather. Matched by IDENTITY against the remat group that
+    ``group`` actually is, so the RS comm is derived from the caller's own group; any other
+    group (a custom / manually-supplied ProcessGroupCollection, or GTP_DECOUPLE_AGRS off → the
+    shadow is None) falls back to ``group`` itself, keeping the RS on the correct communicator.
+    Internal to the GTP module."""
+    if group is _GENERALIZED_TENSOR_PARALLEL_REMAT_GROUP:
+        return _GENERALIZED_TENSOR_PARALLEL_REMAT_RS_GROUP or group
+    if group is _EXPERT_GENERALIZED_TENSOR_PARALLEL_REMAT_GROUP:
+        return _EXPERT_GENERALIZED_TENSOR_PARALLEL_REMAT_RS_GROUP or group
+    return group
 
 
 def get_generalized_tensor_parallel_remat_world_size():
@@ -2483,6 +2537,8 @@ def destroy_model_parallel():
 
     global _GENERALIZED_TENSOR_PARALLEL_REMAT_GROUP
     _GENERALIZED_TENSOR_PARALLEL_REMAT_GROUP = None
+    global _GENERALIZED_TENSOR_PARALLEL_REMAT_RS_GROUP
+    _GENERALIZED_TENSOR_PARALLEL_REMAT_RS_GROUP = None
 
     global _GENERALIZED_TENSOR_PARALLEL_REMAT_GLOBAL_RANKS
     _GENERALIZED_TENSOR_PARALLEL_REMAT_GLOBAL_RANKS = None
@@ -2573,6 +2629,8 @@ def destroy_model_parallel():
     # Destroy parallel state related to expert parallelism.
     global _EXPERT_GENERALIZED_TENSOR_PARALLEL_REMAT_GROUP
     _EXPERT_GENERALIZED_TENSOR_PARALLEL_REMAT_GROUP = None
+    global _EXPERT_GENERALIZED_TENSOR_PARALLEL_REMAT_RS_GROUP
+    _EXPERT_GENERALIZED_TENSOR_PARALLEL_REMAT_RS_GROUP = None
 
     global _EXPERT_GENERALIZED_TENSOR_PARALLEL_REMAT_GLOBAL_RANKS
     _EXPERT_GENERALIZED_TENSOR_PARALLEL_REMAT_GLOBAL_RANKS = None
