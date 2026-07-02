@@ -211,6 +211,30 @@ def get_nccl_options(pg_name, nccl_comm_cfgs):
         return None
 
 
+def get_gtp_rs_shadow_nccl_options(base_pg_name, nccl_comm_cfgs):
+    """NCCL options for a shadow reduce-scatter communicator.
+
+    The shadow RS comm shares the same NCCL config (cga/ctas/net) as its base group
+    (``gtp`` / ``expt_gtp``) so the only intended difference from the all-gather comm is
+    stream priority. Priority is controlled by GTP_RS_LOW_PRIO: unset/0 keeps it
+    high-priority (matches the AG comm, current behavior); =1 makes it default/normal
+    priority so the backward reduce-scatter runs below the high-priority all-gather
+    (compute blocks on the AG, not the RS).
+    """
+    high_priority = os.environ.get("GTP_RS_LOW_PRIO", "0") != "1"
+    cfg = nccl_comm_cfgs.get(base_pg_name, {})
+    nccl_options = torch.distributed.ProcessGroupNCCL.Options(is_high_priority_stream=high_priority)
+    if "cga_cluster_size" in cfg:
+        nccl_options.config.cga_cluster_size = cfg["cga_cluster_size"]
+    if "max_ctas" in cfg:
+        nccl_options.config.max_ctas = cfg["max_ctas"]
+    if "min_ctas" in cfg:
+        nccl_options.config.min_ctas = cfg["min_ctas"]
+    if "net_name" in cfg:
+        nccl_options.config.net_name = cfg["net_name"]
+    return nccl_options
+
+
 def update_pg_timeout(
     timeout: timedelta, pg: Optional[torch._C._distributed_c10d.ProcessGroup] = None
 ):
@@ -956,15 +980,15 @@ def initialize_model_parallel(
             pg_options=get_nccl_options("gtp", nccl_comm_cfgs),
             group_desc="GENERALIZED_TENSOR_PARALLEL_REMAT_GROUP",
         )
-        # Shadow RS comm: same ranks, a separate NCCL communicator (reusing the gtp
-        # high-priority nccl opts) so the backward reduce-scatter overlaps the
-        # all-gather. create_group is collective, so every rank builds it for every
+        # Shadow RS comm: same ranks, a separate NCCL communicator (same gtp NCCL config;
+        # stream priority set by GTP_RS_LOW_PRIO) so the backward reduce-scatter overlaps
+        # the all-gather. create_group is collective, so every rank builds it for every
         # rank-set inside the loop, exactly like the main group above.
         rs_group = (
             create_group(
                 gtp_ranks,
                 timeout=timeout,
-                pg_options=get_nccl_options("gtp", nccl_comm_cfgs),
+                pg_options=get_gtp_rs_shadow_nccl_options("gtp", nccl_comm_cfgs),
                 group_desc="GENERALIZED_TENSOR_PARALLEL_REMAT_RS_GROUP",
             )
             if _decouple_ag_rs
@@ -1379,7 +1403,7 @@ def initialize_model_parallel(
             create_group(
                 egtp_ranks,
                 timeout=timeout,
-                pg_options=get_nccl_options("expt_gtp", nccl_comm_cfgs),
+                pg_options=get_gtp_rs_shadow_nccl_options("expt_gtp", nccl_comm_cfgs),
                 group_desc="EXPERT_GENERALIZED_TENSOR_PARALLEL_REMAT_RS_GROUP",
             )
             if _decouple_ag_rs
