@@ -173,6 +173,15 @@ def classify_gtp_chains(model) -> None:
         # and its input has no dgrad). Skipping its bwd AG saves one collective.
         if "embedding" in name:
             param._need_weight_prefetch_bwd = False
+
+        # Output-layer fwd->bwd weight reuse: its bwd dgrad re-gathers the same full
+        # weight the forward AG just produced, so retain+reuse it and drop the redundant
+        # synchronous bwd all-gather. Name-based opt-in mirrors the embedding opt-out
+        # above; the BF16 (not did_cast) guard in all_gather_and_prefetch auto-disables it
+        # under MXFP8 (fwd rowwise vs bwd columnwise differ). Tied embeddings are an
+        # "embedding..."-named param, so this stays False there.
+        if "output_layer" in name:
+            param._reuse_fwd_weight_in_bwd = True
     if conflicts:
         raise RuntimeError(
             "classify_gtp_chains: the following params were already chain-initialized "
@@ -645,6 +654,11 @@ class GTPShardedParam(torch.nn.Parameter):
         # token ids, and its input is non-differentiable, so no dgrad either).
         # classify_gtp_chains() sets this to False for embedding.word_embeddings.weight.
         self._need_weight_prefetch_bwd = True
+        # Output-layer fwd->bwd weight reuse (flag set for output_layer.weight by
+        # classify_gtp_chains): retain the forward-gathered weight and reuse it in the
+        # backward dgrad instead of re-gathering. See all_gather_and_prefetch.
+        self._reuse_fwd_weight_in_bwd = False
+        self._retained_fwd_weight = None
         self.ag_event = torch.cuda.Event(external=True)
         # DDP backward hook (set by register_grad_accum_hook); invoked after
         # the wgrad RS accumulation completes (Graphed.backward / chain cascade).
@@ -1153,7 +1167,12 @@ class GTPShardedParam(torch.nn.Parameter):
             weight_total
         """
 
-        if GTP_CONFIG.weight_prefetch and self.next_w is not None:
+        if self._retained_fwd_weight is not None:
+            # Reuse the weight the forward pass already gathered (BF16 output
+            # layer) instead of re-gathering it synchronously. Release the pin.
+            result = self._retained_fwd_weight
+            self._retained_fwd_weight = None
+        elif GTP_CONFIG.weight_prefetch and self.next_w is not None:
             result = self._get_prefetched_weight(False, skip_weight_cast=True)
         else:
             result = self._all_gather_weight_on_demand(False, skip_weight_cast=True)
@@ -1184,7 +1203,11 @@ class GTPShardedParam(torch.nn.Parameter):
         if GTP_CONFIG.weight_prefetch and self.next_w is not None:
             cache = get_global_GTP_cache()
             for w in self._weights:
-                cache.release(w._ag_ticket_bwd)
+                # The output-layer fwd->bwd reuse path short-circuits the bwd
+                # gather, so this param's _ag_ticket_bwd may never have been
+                # reserved (None). Only release tickets that actually exist.
+                if w._ag_ticket_bwd is not None:
+                    cache.release(w._ag_ticket_bwd)
 
         return result
 
@@ -1294,6 +1317,20 @@ class GTPShardedParam(torch.nn.Parameter):
             # Second forward pass: flush the complete table atomically to avoid interleaving
             chain["link_table_flushed"] = True
             print_rank_0("\n".join(chain["link_table_buffer"]) + "\n")
+
+        # Retain the forward-gathered output-layer weight for the immediately-following
+        # backward dgrad to reuse (skips the redundant sync re-gather). Its buffer is
+        # pinned (reserve() sets slot.pin) so no other same-shape gather can overwrite it.
+        # Guards: forward (not recompute), output layer, BF16 (low-precision fwd/bwd
+        # representations differ), not full-iteration CG.
+        if (
+            fwd
+            and not in_recompute
+            and self._reuse_fwd_weight_in_bwd
+            and not self.did_cast_to_low_precision
+            and not _FULL_ITERATION
+        ):
+            self._retained_fwd_weight = result
 
         return result
 
@@ -1605,6 +1642,7 @@ class _TicketSlot:
     fwd: bool
     chain_id: str = GTPChain.GRAPHED.value  # chain this slot belongs to
     buf: Optional[torch.Tensor] = field(default=None)  # None when released or after clear()
+    pin: bool = False  # if True, release() never pools this buffer (output-layer fwd reuse)
 
 
 # CUDA-graph memory pool for routing GRAPHED-chain allocations (AG/RS buffers and
@@ -1748,6 +1786,9 @@ class GTPWeightCache:
             reduce_scatter=reduce_scatter,
             fwd=fwd,
             chain_id=getattr(param, "chain_id", GTPChain.UNGRAPHED.value),
+            # Pin only the output-layer forward buffer so it's never pooled — its
+            # gathered weight is retained for backward dgrad (output-layer reuse).
+            pin=bool(fwd and getattr(param, "_reuse_fwd_weight_in_bwd", False)),
         )
         return ticket
 
@@ -1779,7 +1820,9 @@ class GTPWeightCache:
         CUDA-graph-captured buffers keep their fixed address across replays.
         """
         slot = self._slots[ticket]
-        if slot.buf is None:
+        if slot.buf is None or slot.pin:
+            # Pinned buffers (output-layer fwd reuse) must never enter the pool, so
+            # no other same-shape gather can pop and overwrite the retained weight.
             return
         # Use identity check — tensor == tensor returns a multi-element bool tensor
         # which crashes in a boolean context ("Boolean value of Tensor is ambiguous").
