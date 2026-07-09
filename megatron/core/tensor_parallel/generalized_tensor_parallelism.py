@@ -178,13 +178,33 @@ def _classify_param_chain(param_name: str) -> "GTPChain":
     return GTPChain.UNGRAPHED
 
 
+def _stamp_prefetch_steps(name: str) -> tuple:
+    """Resolve (next_fetch_steps, prev_fetch_steps) for a param from its full
+    dotted name, using GTP_CONFIG.prefetch_steps_rules (first substring match
+    wins). Unmatched names get the default depth (1, 1)."""
+    for substr, next_steps, prev_steps in GTP_CONFIG.prefetch_steps_rules:
+        if substr in name:
+            return next_steps, prev_steps
+    return 1, 1
+
+
 def classify_gtp_chains(model) -> None:
     """Walk model.named_parameters() and set chain_id on every GTPShardedParam.
 
     Call once at init, AFTER set_cuda_graph_modules() and BEFORE the first fwd of any
     graphed param. Raises if an already-initialized param would be reclassified into a
     different chain (its prev/next links are already wired into the wrong list).
+
+    Also stamps each param's per-type AG prefetch lookahead (next/prev_fetch_steps)
+    from GTP_CONFIG.prefetch_steps_rules. _debug_name is the full dotted param name
+    populated by tag_gtp_params_with_names(), which runs immediately before this in
+    classify_gtp_remat_chains() — so it is available here; the same ``name`` from
+    named_parameters() is used directly for matching. Committing the schedule here
+    freezes the rule list (no further prefetch_steps_rules edits allowed; see
+    _GTP_PREFETCH_RULES_FROZEN).
     """
+    global _GTP_PREFETCH_RULES_FROZEN
+    _GTP_PREFETCH_RULES_FROZEN = True
     conflicts = []
     for name, param in model.named_parameters():
         if not is_gtp_param(param):
@@ -194,6 +214,9 @@ def classify_gtp_chains(model) -> None:
             conflicts.append((name, param.chain_id, target))
             continue
         param.chain_id = target
+
+        # Per-weight-type AG prefetch lookahead (default 1:1 when unmatched).
+        param.next_fetch_steps, param.prev_fetch_steps = _stamp_prefetch_steps(name)
 
         # Bwd-prefetch opt-out: embedding weight needs no bwd AG (wgrad is a
         # scatter-add on sharded rows, input has no dgrad) — saves one collective.
@@ -222,6 +245,13 @@ class GTPWeightState(Enum):
 # Global GTP buffer cache (persists across clear(); never set to None after creation).
 _GTP_CACHE = None
 _GTP_PARAMS = []
+
+# Set True the first time the prefetch schedule is committed (chains classified or
+# the first cache ticket reserved). Once frozen, the per-weight-type prefetch
+# lookahead rules (GTPRematConfig.prefetch_steps_rules) can no longer change — the
+# schedule must be static before CUDA-graph capture. update_gtp_config() rejects
+# rule edits after this flips.
+_GTP_PREFETCH_RULES_FROZEN = False
 
 # Global set of GTPShardedParam with in-flight async comms (AG or RS).
 _inflight_comm_params: set = set()
@@ -319,13 +349,113 @@ class GTPRematConfig:
     # normalization. When False, the gtp_remat reduce-scatter takes the MEAN so it composes with
     # DDP's 1/replicate scaling to yield the full (replicate x gtp) mean.
     calculate_per_token_loss: bool = False
+    # Per-weight-type all-gather prefetch lookahead. Ordered list of
+    # ``(name_substring, next_steps, prev_steps)`` tuples: the first substring that
+    # matches a param's full dotted ``_debug_name`` (first-match-wins) stamps that
+    # param's forward/backward lookahead depth (see classify_gtp_chains). Unmatched
+    # params keep the default depth 1. Empty list (the default) => every weight
+    # prefetches its immediate chain neighbor only, which is byte-identical to the
+    # pre-feature behavior. Set via update_gtp_config(prefetch_steps_rules=...)
+    # (env bridge GTP_FETCH_STEPS in megatron/training/initialize.py); steps are
+    # validated and clamped to 1..3 there.
+    prefetch_steps_rules: list = field(default_factory=list)
+    # Largest lookahead across all rules (>=1), derived atomically whenever
+    # prefetch_steps_rules is set. Sizes the generation-keyed buffer pool
+    # (n_gen = max_fetch_steps + 1) and gates the enhanced cache path: with
+    # max_fetch_steps == 1 the cache key + ticket path is byte-for-byte unchanged.
+    max_fetch_steps: int = 1
 
 
 GTP_CONFIG = GTPRematConfig()
 
+# Hard cap on per-weight lookahead (=> n_gen <= MAX_FETCH_STEPS_CAP + 1 buffers
+# resident per cache key). Keeps the gen-keyed buffer pool bounded.
+MAX_FETCH_STEPS_CAP = 3
+
+
+def _validate_prefetch_steps_rules(rules):
+    """Validate + normalize a prefetch_steps_rules list, returning
+    ``(clean_rules, max_fetch_steps)``.
+
+    Each rule is ``(name_substring, next_steps, prev_steps)``. Substrings are
+    whitespace-trimmed; steps must be integers clamped to ``1..MAX_FETCH_STEPS_CAP``
+    (a value outside the range is rejected, not silently clamped, so an obviously
+    wrong config fails loud). Empty/duplicate substrings and non-integer steps are
+    rejected. ``max_fetch_steps`` is the global max over all (next, prev) steps,
+    derived atomically here so it can never drift from the rules.
+    """
+    if rules is None:
+        return [], 1
+    if not isinstance(rules, (list, tuple)):
+        raise ValueError(
+            f"GTPRematConfig.prefetch_steps_rules must be a list of "
+            f"(substring, next_steps, prev_steps) tuples, got {type(rules)!r}"
+        )
+    clean = []
+    seen = set()
+    max_steps = 1
+    for rule in rules:
+        if not isinstance(rule, (list, tuple)) or len(rule) != 3:
+            raise ValueError(
+                f"GTPRematConfig.prefetch_steps_rules: each rule must be a 3-tuple "
+                f"(substring, next_steps, prev_steps), got {rule!r}"
+            )
+        substr, next_steps, prev_steps = rule
+        if not isinstance(substr, str):
+            raise ValueError(
+                f"GTPRematConfig.prefetch_steps_rules: substring must be a str, got {substr!r}"
+            )
+        substr = substr.strip()
+        if not substr:
+            raise ValueError(
+                "GTPRematConfig.prefetch_steps_rules: empty/whitespace-only substring "
+                "is not allowed"
+            )
+        if substr in seen:
+            raise ValueError(
+                f"GTPRematConfig.prefetch_steps_rules: duplicate substring {substr!r}"
+            )
+        seen.add(substr)
+        # bool is an int subclass but is never a valid step count.
+        for label, val in (("next_steps", next_steps), ("prev_steps", prev_steps)):
+            if isinstance(val, bool) or not isinstance(val, int):
+                raise ValueError(
+                    f"GTPRematConfig.prefetch_steps_rules[{substr!r}]: {label} must be an "
+                    f"int, got {val!r}"
+                )
+            if not (1 <= val <= MAX_FETCH_STEPS_CAP):
+                raise ValueError(
+                    f"GTPRematConfig.prefetch_steps_rules[{substr!r}]: {label}={val} out of "
+                    f"range; must be in 1..{MAX_FETCH_STEPS_CAP}"
+                )
+        clean.append((substr, int(next_steps), int(prev_steps)))
+        max_steps = max(max_steps, int(next_steps), int(prev_steps))
+    return clean, max_steps
+
 
 def update_gtp_config(**kwargs):
     """Update the global GTP configuration."""
+    if "prefetch_steps_rules" in kwargs:
+        # The prefetch schedule must be frozen before chains are classified / the
+        # first cache ticket is reserved (CUDA-graph capture replays a static op
+        # sequence). Reject any rule edit after that point.
+        if _GTP_PREFETCH_RULES_FROZEN:
+            raise RuntimeError(
+                "update_gtp_config(prefetch_steps_rules=...): the prefetch schedule is "
+                "already frozen (chains classified or cache tickets reserved). Set "
+                "GTP_FETCH_STEPS / prefetch_steps_rules before model init / first forward."
+            )
+        clean_rules, max_steps = _validate_prefetch_steps_rules(kwargs["prefetch_steps_rules"])
+        # Derive max_fetch_steps atomically with the rules so the two never drift.
+        kwargs["prefetch_steps_rules"] = clean_rules
+        kwargs["max_fetch_steps"] = max_steps
+    if "max_fetch_steps" in kwargs and "prefetch_steps_rules" not in kwargs:
+        # max_fetch_steps is a derived field; setting it directly would let it drift
+        # from the rules. Block the standalone path.
+        raise ValueError(
+            "GTPRematConfig.max_fetch_steps is derived from prefetch_steps_rules and cannot "
+            "be set directly; pass prefetch_steps_rules instead."
+        )
     for key, value in kwargs.items():
         if not hasattr(GTP_CONFIG, key):
             raise ValueError(f"Unknown GTP config option: {key}")
@@ -705,6 +835,18 @@ def _init_gtp_runtime_attrs(obj):
     # (wgrad is a token-indexed scatter-add, input non-differentiable). classify_gtp_chains()
     # sets this False for embedding.word_embeddings.weight.
     obj._need_weight_prefetch_bwd = True
+    # Per-weight-type AG prefetch lookahead depth (>=1). Default 1 reproduces
+    # the pre-feature depth-1 behavior (prefetch only the immediate chain
+    # neighbor). classify_gtp_chains() stamps these from
+    # GTP_CONFIG.prefetch_steps_rules via first-match-wins on _debug_name.
+    obj.next_fetch_steps = 1  # forward lookahead (walk next_w)
+    obj.prev_fetch_steps = 1  # backward lookahead (walk prev_w)
+    # Issued-but-not-yet-consumed guard for the active-window prefetch walk.
+    # This is the dedup basis for depth>1 prefetch — NOT _prefetch_handle, which
+    # wait_async_comms()/_wait_param_gather() null mid-iteration (see
+    # _weights_to_prefetch). Set True right after an AG is issued, cleared ONLY
+    # at consume (_get_prefetched_weight), never at drain.
+    obj._prefetch_pending_consume = False
     obj.ag_event = torch.cuda.Event(external=True)
     # DDP backward hook (set by register_grad_accum_hook); invoked after
     # the wgrad RS accumulation completes (Graphed.backward / chain cascade).
@@ -784,6 +926,57 @@ class GTPShardedParam(torch.nn.Parameter):
         if chain_id not in cls._recompute_chain_state:
             cls._recompute_chain_state[chain_id] = {"last_weight": None}
         return cls._recompute_chain_state[chain_id]
+
+    def _weights_to_prefetch(self, link_attr: str, steps: int, need_bwd: bool = False):
+        """Weights to issue an AG for now, to keep the *active* (in-flight) prefetch
+        window at depth ``steps`` ahead of ``self`` (the weight being consumed).
+
+        Walk consume order from this weight (``link_attr`` = ``"next_w"`` forward /
+        ``"prev_w"`` backward), counting prefetchable weights toward ``steps``: a
+        target already issued this cycle counts toward the window but is NOT
+        re-issued; a not-yet-issued one is collected to issue. Weights that don't
+        prefetch (``_need_weight_prefetch`` off, or the bwd opt-out when
+        ``need_bwd``) are skipped without counting, so opt-out holes don't shrink the
+        window. Stop once ``steps`` are active. With ``steps == 1`` this returns just
+        the next prefetchable weight (or [] if it is already in flight), matching the
+        depth-1 single-neighbor behavior — the head fills the window, each later
+        consume refills the one slot that drained.
+
+        Dedup basis is ``_prefetch_pending_consume`` (set at issue, cleared only at
+        consume), NOT ``_prefetch_handle``: wait_async_comms() / _wait_param_gather()
+        null the handle (and set _already_ag_drained) mid-iteration at CG segment
+        boundaries, so a prefetched-but-unconsumed weight has handle=None. A
+        handle-based dedup would re-issue it at depth>1 -> double collective +
+        clobbered buffer. An issued-and-pending weight must therefore never have a
+        live handle AND be undrained: assert that.
+        """
+        to_issue = []
+        active = 0
+        w = getattr(self, link_attr)
+        while w is not None and active < steps:
+            prefetchable = w._need_weight_prefetch and (
+                w._need_weight_prefetch_bwd or not need_bwd
+            )
+            if prefetchable:
+                if w._prefetch_pending_consume:
+                    # Already in flight (or drained-but-unconsumed) this cycle:
+                    # counts toward the window, must not be re-issued. Invariant: a
+                    # pending target is either still in flight (handle set) or already
+                    # drained (handle None, _already_ag_drained True) — it can never be
+                    # pending with handle None AND undrained. Fail loud if that happens.
+                    assert not (
+                        w._prefetch_handle is None
+                        and not getattr(w, "_already_ag_drained", False)
+                    ), (
+                        f"[GTP] {w._debug_name}: _prefetch_pending_consume=True but "
+                        "_prefetch_handle is None and not drained — prefetch dedup "
+                        "invariant violated (see _weights_to_prefetch)."
+                    )
+                else:
+                    to_issue.append(w)
+                active += 1
+            w = getattr(w, link_attr)
+        return to_issue
 
     @classmethod
     def _buffer_link_table_row(
@@ -1155,6 +1348,14 @@ class GTPShardedParam(torch.nn.Parameter):
         result = [self._strip_padding(r) for r in result]
 
         result = [r.detach().requires_grad_(w.requires_grad) for r, w in zip(result, self._weights)]
+
+        # This weight has now been consumed: clear the active-window guard so the
+        # next-cycle prefetch walk may re-issue it. Cleared here (the ONLY consume
+        # site) and never at drain — wait_async_comms()/_wait_param_gather() may have
+        # nulled _prefetch_handle / set _already_ag_drained, but the pending flag
+        # stays set until this point (see _weights_to_prefetch).
+        self._prefetch_pending_consume = False
+
         return result if self.is_routed_expert else result[0]
 
     def _wait_recompute_param_gather(self):
@@ -1218,22 +1419,45 @@ class GTPShardedParam(torch.nn.Parameter):
         else:
             result = self._all_gather_weight_on_demand(False, skip_weight_cast=True)
 
-        if (
-            GTP_CONFIG.weight_prefetch
-            and self.prev_w is not None
-            and self.prev_w._need_weight_prefetch
-            and self.prev_w._need_weight_prefetch_bwd
-        ):
-            # Pre-AG work (quantize, ticket lookup) runs on caller's stream; the NCCL collective
-            # is wrapped on ag_stream inside _all_gather_weight (see its async/sync gate).
-            _, handle = self.prev_w._all_gather_weight(
-                async_op=True,
-                skip_weight_cast=True,
-                cast_noop_flag=None,
-                fwd=False,
-                nvtx_label=nvtx_label,
-            )
-            self.prev_w._prefetch_handle = handle
+        if GTP_CONFIG.weight_prefetch and self.prev_w is not None:
+            if GTP_CONFIG.max_fetch_steps == 1:
+                # Default depth-1 fast path: single immediate neighbor only, byte-for-byte
+                # identical to pre-feature behavior (no active-window walk, no pending
+                # flag write). Mirrors the original prev_w condition exactly.
+                if (
+                    self.prev_w._need_weight_prefetch
+                    and self.prev_w._need_weight_prefetch_bwd
+                ):
+                    # Pre-AG work (quantize, ticket lookup) runs on caller's stream; the
+                    # NCCL collective is wrapped on ag_stream inside _all_gather_weight
+                    # (see its async/sync gate).
+                    _, handle = self.prev_w._all_gather_weight(
+                        async_op=True,
+                        skip_weight_cast=True,
+                        cast_noop_flag=None,
+                        fwd=False,
+                        nvtx_label=nvtx_label,
+                    )
+                    self.prev_w._prefetch_handle = handle
+            else:
+                # Active-window backward prefetch (depth>1): issue AGs for the
+                # not-yet-in-flight weights in the next self.prev_fetch_steps
+                # prefetchable hops walking prev_w. need_bwd=True so _weights_to_prefetch
+                # honors the bwd opt-out (_need_weight_prefetch_bwd, e.g. embedding).
+                for tgt in self._weights_to_prefetch(
+                    "prev_w", self.prev_fetch_steps, need_bwd=True
+                ):
+                    # Pre-AG work (quantize, ticket lookup) runs on caller's stream;
+                    # the NCCL collective is wrapped on ag_stream inside _all_gather_weight.
+                    _, handle = tgt._all_gather_weight(
+                        async_op=True,
+                        skip_weight_cast=True,
+                        cast_noop_flag=None,
+                        fwd=False,
+                        nvtx_label=nvtx_label,
+                    )
+                    tgt._prefetch_handle = handle
+                    tgt._prefetch_pending_consume = True
 
         # The unsharded tensor has been returned, no pending work so reset state to NONE
         if GTP_CONFIG.check_param_states:
@@ -1286,22 +1510,39 @@ class GTPShardedParam(torch.nn.Parameter):
             and self._recompute_next._need_weight_prefetch
         ):
             self._recompute_prefetch_next(self._recompute_next, nvtx_label=nvtx_label)
-        elif (
-            not in_recompute
-            and GTP_CONFIG.weight_prefetch
-            and self.next_w is not None
-            and self.next_w._need_weight_prefetch
-        ):
-            # Pre-AG work on caller; NCCL wrap lives at the collective site
-            # inside _all_gather_weight. See all_gather_and_prefetch_bwd.
-            _, handle = self.next_w._all_gather_weight(
-                async_op=True,
-                skip_weight_cast=skip_weight_cast,
-                cast_noop_flag=cast_noop_flag,
-                fwd=fwd,
-                nvtx_label=nvtx_label,
-            )
-            self.next_w._prefetch_handle = handle
+        elif not in_recompute and GTP_CONFIG.weight_prefetch and self.next_w is not None:
+            if GTP_CONFIG.max_fetch_steps == 1:
+                # Default depth-1 fast path: single immediate neighbor only, byte-for-byte
+                # identical to pre-feature behavior (no active-window walk, no pending
+                # flag write). Mirrors the original next_w condition exactly.
+                if self.next_w._need_weight_prefetch:
+                    # Pre-AG work on caller; NCCL wrap lives at the collective site
+                    # inside _all_gather_weight. See all_gather_and_prefetch_bwd.
+                    _, handle = self.next_w._all_gather_weight(
+                        async_op=True,
+                        skip_weight_cast=skip_weight_cast,
+                        cast_noop_flag=cast_noop_flag,
+                        fwd=fwd,
+                        nvtx_label=nvtx_label,
+                    )
+                    self.next_w._prefetch_handle = handle
+            else:
+                # Active-window prefetch (depth>1): issue AGs for the not-yet-in-flight
+                # weights in the next self.next_fetch_steps prefetchable hops.
+                # _weights_to_prefetch dedups on _prefetch_pending_consume so a weight
+                # already in flight (or drained-but-unconsumed) is not re-issued.
+                for tgt in self._weights_to_prefetch("next_w", self.next_fetch_steps):
+                    # Pre-AG work on caller; NCCL wrap lives at the collective site
+                    # inside _all_gather_weight. See all_gather_and_prefetch_bwd.
+                    _, handle = tgt._all_gather_weight(
+                        async_op=True,
+                        skip_weight_cast=skip_weight_cast,
+                        cast_noop_flag=cast_noop_flag,
+                        fwd=fwd,
+                        nvtx_label=nvtx_label,
+                    )
+                    tgt._prefetch_handle = handle
+                    tgt._prefetch_pending_consume = True
 
         # Unsharded tensor returned, no pending work → reset state to NONE. Skip during recompute:
         # a bwd-chain prefetch may hold an in-flight AG state this weight's later dgrad needs.
@@ -1672,6 +1913,11 @@ class GTPWeightCache:
         self._next_ticket: int = 0
         self._total_bytes: int = 0  # running total of allocated bytes
         self.key_to_allocate_func = {}
+        # Round-robin generation counters for the depth>1 prefetch buffer pool.
+        # Keyed by the generation-key (base cache key, made direction-scoped for
+        # plain torch.dtype keys — see reserve). Empty / unused in the default
+        # max_fetch_steps==1 path.
+        self._key_gen_count: Dict[tuple, int] = defaultdict(int)
 
     @staticmethod
     def _buf_bytes(shape, dtype) -> int:
@@ -1731,7 +1977,33 @@ class GTPWeightCache:
 
     def reserve(self, param: "GTPShardedParam", dtype, fwd: bool, reduce_scatter=False) -> int:
         """Assign a persistent ticket.  No buffer is allocated until ``get()``."""
+        # First ticket commits the prefetch schedule: freeze the rule list so it can
+        # no longer change (the gen-key sizing below reads GTP_CONFIG.max_fetch_steps,
+        # which must be stable before any buffer is keyed). classify_gtp_chains also
+        # freezes; whichever runs first wins.
+        global _GTP_PREFETCH_RULES_FROZEN
+        _GTP_PREFETCH_RULES_FROZEN = True
         key = param._get_cache_key(dtype, fwd, reduce_scatter)
+        # Depth>1 prefetch can keep up to max_fetch_steps+1 same-shape AG gathers of
+        # the same (layer-agnostic) key in flight at once. Split the buffer pool by a
+        # round-robin generation suffix so concurrent in-flight weights draw distinct
+        # physical buffers. Gated to AG only (RS is not depth-prefetched) and only
+        # when GTP_CONFIG.max_fetch_steps > 1 — so the default depth-1 path leaves the
+        # key + ticket allocation byte-for-byte unchanged.
+        if not reduce_scatter and GTP_CONFIG.max_fetch_steps > 1:
+            n_gen = GTP_CONFIG.max_fetch_steps + 1
+            # _get_cache_key already encodes direction for quantized dtypes but NOT
+            # for plain torch.dtype (bf16 key = (shape, dtype, expert_idx, rs)). Under
+            # activation recompute a weight can have a recompute-fwd AG and a dgrad-bwd
+            # AG of the same bf16 weight in flight at once; without direction in the
+            # key they would share a pool bucket and could alias. So for torch.dtype
+            # keys, make BOTH the generation counter AND the buffer bucket
+            # direction-scoped (quantized keys already carry direction).
+            if isinstance(dtype, torch.dtype):
+                key = key + (fwd,)
+            gen = self._key_gen_count[key] % n_gen
+            self._key_gen_count[key] += 1
+            key = key + (gen,)
         ticket = self._next_ticket
         self._next_ticket += 1
 

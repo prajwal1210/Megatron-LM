@@ -368,6 +368,34 @@ def _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks, s
                     "or set both --gtp_remat-weight-remat-size and "
                     "--expert-generalized-tensor-parallel-remat-size to 1."
                 )
+                # Per-weight-type AG prefetch lookahead (nsys-tunable, no code edits).
+                # GTP_FETCH_STEPS = "<substr>:<next>:<prev>,..." e.g.
+                # "mixer.in_proj:3:1,self_attention:2:2". First matching substring of a
+                # param's full dotted name wins (ordered). Empty / unset => no rules =>
+                # every weight prefetches its immediate neighbor only (byte-identical to
+                # the pre-feature default). Validation/clamping (steps in 1..3, dup/empty
+                # rejection) happens in update_gtp_config().
+                _fetch_steps_env = os.environ.get("GTP_FETCH_STEPS", "").strip()
+                if _fetch_steps_env:
+                    from megatron.core.tensor_parallel.generalized_tensor_parallelism import (
+                        update_gtp_config,
+                    )
+
+                    _rules = []
+                    for _entry in _fetch_steps_env.split(","):
+                        _entry = _entry.strip()
+                        if not _entry:
+                            continue
+                        _parts = _entry.split(":")
+                        if len(_parts) != 3:
+                            raise ValueError(
+                                f"GTP_FETCH_STEPS entry {_entry!r} is malformed; expected "
+                                "'<substr>:<next_steps>:<prev_steps>'."
+                            )
+                        _substr, _next_s, _prev_s = _parts
+                        _rules.append((_substr.strip(), int(_next_s), int(_prev_s)))
+                    update_gtp_config(prefetch_steps_rules=_rules)
+                    print_rank_0(f"> GTP per-type prefetch lookahead rules: {_rules}")
             mpu.initialize_model_parallel(
                 args.tensor_model_parallel_size,
                 args.pipeline_model_parallel_size,
