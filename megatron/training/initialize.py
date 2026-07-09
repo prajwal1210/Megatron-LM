@@ -375,7 +375,26 @@ def _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks, s
                 # every weight prefetches its immediate neighbor only (byte-identical to
                 # the pre-feature default). Validation/clamping (steps in 1..3, dup/empty
                 # rejection) happens in update_gtp_config().
+                # Plan-driven variant: GTP_COMM_PLAN points at a lowered plan
+                # artifact from the gtp-profiler analyzer (lower-gtp CLI):
+                # {"gtp_fetch_steps": "<substr>:<next>:<prev>,...", ...}. Every rank
+                # must be given the same file (the schedule is part of the program).
+                # An explicit GTP_FETCH_STEPS overrides the plan.
                 _fetch_steps_env = os.environ.get("GTP_FETCH_STEPS", "").strip()
+                _plan_path = os.environ.get("GTP_COMM_PLAN", "").strip()
+                if _plan_path and not _fetch_steps_env:
+                    import json as _json
+
+                    with open(_plan_path) as _f:
+                        _fetch_steps_env = str(
+                            _json.load(_f).get("gtp_fetch_steps", "")
+                        ).strip()
+                    print_rank_0(
+                        f"> GTP communication plan {_plan_path!r}: "
+                        + ("applying lowered fetch-steps"
+                           if _fetch_steps_env else
+                           "no non-default rules (runtime default realizes the plan)")
+                    )
                 if _fetch_steps_env:
                     from megatron.core.tensor_parallel.generalized_tensor_parallelism import (
                         update_gtp_config,
