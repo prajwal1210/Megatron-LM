@@ -275,6 +275,7 @@ class TestWeightsToPrefetch:
     def test_depth_one_returns_empty_if_pending(self):
         c = _build_chain(4)
         c[1]._prefetch_pending_consume = True
+        c[1]._prefetch_handle = object()  # in flight: issue site sets both
         # next_w already in flight -> nothing new to issue, but window is full.
         out = c[0]._weights_to_prefetch("next_w", 1)
         assert out == []
@@ -290,6 +291,7 @@ class TestWeightsToPrefetch:
         c = _build_chain(6)
         for w in (c[1], c[2], c[3]):
             w._prefetch_pending_consume = True
+            w._prefetch_handle = object()  # in flight: issue site sets both
         out = c[1]._weights_to_prefetch("next_w", 3)
         # c[2], c[3] pending (count, not issue); c[4] not pending -> issue.
         assert out == [c[4]]
@@ -336,9 +338,13 @@ class TestWeightsToPrefetch:
         issued = []
         for i, d in enumerate(depths):
             for tgt in c[i]._weights_to_prefetch("next_w", d):
-                assert tgt not in issued, f"{c.index(tgt)} issued twice"
+                # identity-based membership: tensor __eq__ is elementwise
+                pos = next(j for j, w in enumerate(c) if w is tgt)
+                assert not any(tgt is w for w in issued), f"{pos} issued twice"
                 issued.append(tgt)
-                tgt._prefetch_pending_consume = True  # mirror the issue site
+                # mirror the issue site: pending flag + live handle
+                tgt._prefetch_pending_consume = True
+                tgt._prefetch_handle = object()
 
     def test_drained_unconsumed_target_not_reissued(self):
         """LOAD-BEARING regression.

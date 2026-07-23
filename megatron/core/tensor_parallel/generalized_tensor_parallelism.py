@@ -188,6 +188,16 @@ def _stamp_prefetch_steps(name: str) -> tuple:
     return 1, 1
 
 
+def _stamp_rs_hold(name: str) -> int:
+    """Resolve rs_hold_steps for a param from its full dotted name, using
+    GTP_CONFIG.rs_hold_rules (first substring match wins). Unmatched names get 0
+    (issue the wgrad RS at its own site — today's behavior)."""
+    for substr, hold_steps in GTP_CONFIG.rs_hold_rules:
+        if substr in name:
+            return hold_steps
+    return 0
+
+
 def classify_gtp_chains(model) -> None:
     """Walk model.named_parameters() and set chain_id on every GTPShardedParam.
 
@@ -203,9 +213,14 @@ def classify_gtp_chains(model) -> None:
     freezes the rule list (no further prefetch_steps_rules edits allowed; see
     _GTP_PREFETCH_RULES_FROZEN).
     """
-    global _GTP_PREFETCH_RULES_FROZEN
+    global _GTP_PREFETCH_RULES_FROZEN, _RS_HOLDS_ENABLED
     _GTP_PREFETCH_RULES_FROZEN = True
     conflicts = []
+    rule_hits = {substr: 0 for substr, _, _ in GTP_CONFIG.prefetch_steps_rules}
+    rs_hold_hits = {substr: 0 for substr, _ in GTP_CONFIG.rs_hold_rules}
+    stamped = []
+    rs_stamped = []
+    rs_graphed_ignored = []
     for name, param in model.named_parameters():
         if not is_gtp_param(param):
             continue
@@ -217,11 +232,69 @@ def classify_gtp_chains(model) -> None:
 
         # Per-weight-type AG prefetch lookahead (default 1:1 when unmatched).
         param.next_fetch_steps, param.prev_fetch_steps = _stamp_prefetch_steps(name)
+        if (param.next_fetch_steps, param.prev_fetch_steps) != (1, 1):
+            stamped.append((name, param.next_fetch_steps, param.prev_fetch_steps))
+        for substr, _, _ in GTP_CONFIG.prefetch_steps_rules:
+            if substr in name:
+                rule_hits[substr] += 1
+                break
+
+        # Per-weight wgrad-RS hold (default 0 = issue at own site). v1 is
+        # eager-only: a hold on a GRAPHED-chain weight is forced to 0 so the
+        # CUDA-graph capture path stays byte-identical.
+        hold = _stamp_rs_hold(name)
+        if hold > 0 and target == GTPChain.GRAPHED.value:
+            rs_graphed_ignored.append(name)
+            hold = 0
+        param.rs_hold_steps = hold
+        if hold > 0:
+            rs_stamped.append((name, hold))
+        for substr, _ in GTP_CONFIG.rs_hold_rules:
+            if substr in name:
+                rs_hold_hits[substr] += 1
+                break
 
         # Bwd-prefetch opt-out: embedding weight needs no bwd AG (wgrad is a
         # scatter-add on sharded rows, input has no dgrad) — saves one collective.
         if "embedding" in name:
             param._need_weight_prefetch_bwd = False
+    if GTP_CONFIG.prefetch_steps_rules:
+        # A rule matching zero params is a plan-integrity failure (wrong name
+        # namespace / typo) that would otherwise silently no-op the plan. Warn
+        # rather than raise: rules lowered for the full model may legitimately
+        # miss on a smaller proxy (fewer layers).
+        unmatched = [s for s, n in rule_hits.items() if n == 0]
+        if unmatched:
+            logger.warning(
+                "[GTP] prefetch lookahead rule(s) matched NO parameters "
+                "(no effect): %s", unmatched,
+            )
+        logger.info(
+            "[GTP] prefetch lookahead: %d param(s) stamped non-default: %s",
+            len(stamped), [(n, f"{nx}:{pv}") for n, nx, pv in stamped],
+        )
+    if GTP_CONFIG.rs_hold_rules:
+        rs_unmatched = [s for s, n in rs_hold_hits.items() if n == 0]
+        if rs_unmatched:
+            logger.warning(
+                "[GTP] rs_hold rule(s) matched NO parameters (no effect): %s",
+                rs_unmatched,
+            )
+        if rs_graphed_ignored:
+            logger.warning(
+                "[GTP] rs_hold ignored on %d GRAPHED-chain weight(s) "
+                "(v1 is eager-only): %s",
+                len(rs_graphed_ignored), rs_graphed_ignored[:4],
+            )
+        logger.info(
+            "[GTP] rs_hold: %d param(s) stamped non-default: %s",
+            len(rs_stamped), rs_stamped,
+        )
+    # Accumulate, never overwrite: this runs once per model chunk (see the
+    # classify_gtp_remat_chains loop), and a later chunk with zero eager
+    # matches must not disable holds stamped by an earlier chunk. The reset
+    # to False lives in reset_gtp_state(), called before the chunk loop.
+    _RS_HOLDS_ENABLED = _RS_HOLDS_ENABLED or bool(rs_stamped)
     if conflicts:
         raise RuntimeError(
             "classify_gtp_chains: the following params were already chain-initialized "
@@ -246,15 +319,36 @@ class GTPWeightState(Enum):
 _GTP_CACHE = None
 _GTP_PARAMS = []
 
-# Set True the first time the prefetch schedule is committed (chains classified or
-# the first cache ticket reserved). Once frozen, the per-weight-type prefetch
-# lookahead rules (GTPRematConfig.prefetch_steps_rules) can no longer change — the
+# Set True the first time the communication schedule is committed (chains classified
+# or the first cache ticket reserved). Once frozen, the per-weight-type rules
+# (GTPRematConfig.prefetch_steps_rules AND rs_hold_rules) can no longer change — the
 # schedule must be static before CUDA-graph capture. update_gtp_config() rejects
 # rule edits after this flips.
 _GTP_PREFETCH_RULES_FROZEN = False
 
 # Global set of GTPShardedParam with in-flight async comms (AG or RS).
 _inflight_comm_params: set = set()
+
+# RS hold/flush (plan-driven reduce-scatter placement). Set True by
+# classify_gtp_chains only when >=1 param is stamped with rs_hold_steps > 0; every
+# hot-path hold block is gated on it so the no-rules default stays byte-identical.
+_RS_HOLDS_ENABLED = False
+# chain_id -> FIFO of GTPShardedParam whose RS is parked (see _park_held_rs).
+_held_rs_queues: Dict[str, list] = {}
+# chain_id -> FIFO of flushed-held params awaiting deferred finalize. A held
+# weight's RS is NOT finalized by the next site's cascade (that wait is the
+# "checkpoint" that serialized held RSs); it is finalized rs_finalize_lag
+# RS-sites after its flush (_rs_finalize_tick), giving the collective real GPU
+# overlap while bounding pinned wgrad buffers to ~lag+1 per chain. Entries are
+# [param, age] pairs; order and ages are pure call-order state (rank-uniform).
+_rs_finalize_queues: Dict[str, list] = {}
+# chain_id -> set of rs_streams that performed a deferred main_grad.add_ this
+# backward. The v1 cascade's compute-stream wait implicitly ordered every
+# finalize before downstream main_grad readers (grad-norm/optimizer); with
+# finalizes deferred to rs_stream, the chain-tail drain must WAIT these
+# streams on the compute stream or the optimizer can race the adds
+# (observed at 32N: iteration-72 inf, finite on rerun — classic race).
+_rs_finalize_streams: Dict[str, set] = {}
 _AG_STREAMS: Dict[str, torch.cuda.Stream] = {}
 _RS_STREAMS: Dict[str, torch.cuda.Stream] = {}
 
@@ -285,6 +379,77 @@ def _wgrad_pool_put(buf: torch.Tensor):
     if key not in _wgrad_buf_pool:
         _wgrad_buf_pool[key] = []
     _wgrad_buf_pool[key].append(buf)
+
+
+def _rs_hold_tick(chain_id: str):
+    """Advance the held-RS countdowns for one chain and flush entries that are due.
+
+    Called at the entry of every wgrad RS-site on the chain (the parking site
+    itself does not tick — parking happens after this runs for the parking
+    weight's own call). Purely call-order-driven, so the flush order is
+    identical on every rank. Entries flush in FIFO order among those due; with
+    mixed hold depths a later-parked shorter hold may legally flush before an
+    earlier-parked longer one (per-entry due dates, still deterministic).
+    """
+    queue = _held_rs_queues.get(chain_id)
+    if not queue:
+        return
+    for param in list(queue):
+        param._held_rs["remaining"] -= 1
+        if param._held_rs["remaining"] <= 0:
+            param._flush_held_rs()
+
+
+def _rs_finalize_tick(chain_id: str):
+    """Finalize flushed-held RSs that have aged rs_finalize_lag RS-sites.
+
+    Runs at the END of every wgrad RS-site. The lag replaces the cascade's
+    next-site wait for held weights: the collective gets `lag` full sites of
+    GPU overlap before anyone blocks on it, while pinned wgrad input buffers
+    stay bounded (~lag+1 per chain). Ages are call-order state — rank-uniform.
+    """
+    queue = _rs_finalize_queues.get(chain_id)
+    if not queue:
+        return
+    for entry in list(queue):
+        entry[1] += 1
+        if entry[1] >= GTP_CONFIG.rs_finalize_lag:
+            param = entry[0]
+            for i, e in enumerate(queue):
+                if e is entry:
+                    del queue[i]
+                    break
+            param._wait_reduce_scatter(finalize_grad=True)
+            # consume the flag (mirrors the cascade's consumption) so the next
+            # micro-batch starts clean.
+            param._already_finalized = False
+
+
+def _rs_drain_chain(chain_id: str):
+    """Chain-tail drain: flush every still-parked RS and finalize everything
+    pending. Runs at the chain head's RS-site — the LAST backward RS-site of
+    the chain (eager mode has no other end-of-backward hook; the cascade,
+    which used to guarantee finalization, is skipped for held weights).
+    """
+    queue = _held_rs_queues.get(chain_id)
+    while queue:
+        queue[0]._flush_held_rs()
+    fqueue = _rs_finalize_queues.get(chain_id)
+    while fqueue:
+        param = fqueue.pop(0)[0]
+        param._wait_reduce_scatter(finalize_grad=True)
+        param._already_finalized = False
+    # Ordering barrier: every deferred finalize accumulated main_grad on its
+    # rs_stream; downstream main_grad readers (grad norm, optimizer) run on
+    # the compute stream. Without this wait the optimizer can race the adds
+    # (observed: sporadic inf, finite on rerun). One wait per stream per
+    # backward — negligible cost, mandatory correctness.
+    streams = _rs_finalize_streams.get(chain_id)
+    if streams:
+        cur = torch.cuda.current_stream()
+        for s in streams:
+            cur.wait_stream(s)
+        streams.clear()
 
 
 def _stream_key(chain_id: str, group) -> tuple:
@@ -364,6 +529,24 @@ class GTPRematConfig:
     # (n_gen = max_fetch_steps + 1) and gates the enhanced cache path: with
     # max_fetch_steps == 1 the cache key + ticket path is byte-for-byte unchanged.
     max_fetch_steps: int = 1
+    # Per-weight wgrad reduce-scatter hold. Ordered list of
+    # ``(name_substring, hold_steps)`` pairs (first-match-wins on the full dotted
+    # param name): a matched weight's async RS is PARKED at its issue site and
+    # flushed at the entry of the hold_steps-th subsequent wgrad RS-site on the
+    # same chain — landing it behind that weight's backward all-gather on the
+    # NCCL queue (AG-before-RS). Empty list (default) => every RS issues at its
+    # own site, byte-identical to pre-feature behavior. v1 is eager-only
+    # (GRAPHED-chain matches are ignored with a warning) and the cascade
+    # finalize force-flushes, capping the effective ordering benefit at ~1 step
+    # (deeper holds degrade gracefully, staying correct). Set via
+    # update_gtp_config(rs_hold_rules=...) (env bridge GTP_RS_HOLD / plan key
+    # gtp_rs_hold in megatron/training/initialize.py).
+    rs_hold_rules: list = field(default_factory=list)
+    # RS-sites of GPU overlap a flushed-held RS gets before its deferred
+    # finalize waits on it (_rs_finalize_tick). Bounds pinned wgrad input
+    # buffers to ~rs_finalize_lag+1 per chain. Only consulted when rs_hold
+    # rules are active.
+    rs_finalize_lag: int = 2
 
 
 GTP_CONFIG = GTPRematConfig()
@@ -371,6 +554,10 @@ GTP_CONFIG = GTPRematConfig()
 # Hard cap on per-weight lookahead (=> n_gen <= MAX_FETCH_STEPS_CAP + 1 buffers
 # resident per cache key). Keeps the gen-keyed buffer pool bounded.
 MAX_FETCH_STEPS_CAP = 3
+
+# Hard cap on rs_hold_steps. Holding pins the wgrad send buffer for the hold's
+# duration, so the bound also bounds concurrently-held wgrad memory.
+MAX_RS_HOLD_CAP = 3
 
 
 def _validate_prefetch_steps_rules(rules):
@@ -433,8 +620,83 @@ def _validate_prefetch_steps_rules(rules):
     return clean, max_steps
 
 
+def _validate_rs_hold_rules(rules):
+    """Validate + normalize an rs_hold_rules list, returning the clean list.
+
+    Each rule is ``(name_substring, hold_steps)``. Substrings are
+    whitespace-trimmed, non-empty, and unique; hold_steps must be an int in
+    ``1..MAX_RS_HOLD_CAP`` (0 is rejected — the absence of a rule is the 0
+    encoding; out-of-range fails loud rather than clamping silently).
+    """
+    if rules is None:
+        return []
+    if not isinstance(rules, (list, tuple)):
+        raise ValueError(
+            f"GTPRematConfig.rs_hold_rules must be a list of "
+            f"(substring, hold_steps) tuples, got {type(rules)!r}"
+        )
+    clean = []
+    seen = set()
+    for rule in rules:
+        if not isinstance(rule, (list, tuple)) or len(rule) != 2:
+            raise ValueError(
+                f"GTPRematConfig.rs_hold_rules: each rule must be a 2-tuple "
+                f"(substring, hold_steps), got {rule!r}"
+            )
+        substr, hold_steps = rule
+        if not isinstance(substr, str):
+            raise ValueError(
+                f"GTPRematConfig.rs_hold_rules: substring must be a str, got {substr!r}"
+            )
+        substr = substr.strip()
+        if not substr:
+            raise ValueError(
+                "GTPRematConfig.rs_hold_rules: empty/whitespace-only substring "
+                "is not allowed"
+            )
+        if substr in seen:
+            raise ValueError(
+                f"GTPRematConfig.rs_hold_rules: duplicate substring {substr!r}"
+            )
+        seen.add(substr)
+        if isinstance(hold_steps, bool) or not isinstance(hold_steps, int):
+            raise ValueError(
+                f"GTPRematConfig.rs_hold_rules[{substr!r}]: hold_steps must be an "
+                f"int, got {hold_steps!r}"
+            )
+        if not (1 <= hold_steps <= MAX_RS_HOLD_CAP):
+            raise ValueError(
+                f"GTPRematConfig.rs_hold_rules[{substr!r}]: hold_steps={hold_steps} "
+                f"out of range; must be in 1..{MAX_RS_HOLD_CAP} (omit the rule for 0)"
+            )
+        clean.append((substr, int(hold_steps)))
+    return clean
+
+
 def update_gtp_config(**kwargs):
     """Update the global GTP configuration."""
+    if "rs_finalize_lag" in kwargs:
+        if _GTP_PREFETCH_RULES_FROZEN:
+            raise RuntimeError(
+                "update_gtp_config(rs_finalize_lag=...): the communication schedule "
+                "is already frozen; set it before model init / first forward."
+            )
+        _lag = kwargs["rs_finalize_lag"]
+        if isinstance(_lag, bool) or not isinstance(_lag, int) or not (1 <= _lag <= 3):
+            raise ValueError(
+                f"GTPRematConfig.rs_finalize_lag must be an int in 1..3, got {_lag!r} "
+                "(each unit pins ~one extra wgrad buffer per chain)"
+            )
+    if "rs_hold_rules" in kwargs:
+        # Same freeze point as the prefetch rules: the communication schedule is
+        # committed at classify_gtp_chains / first ticket reserve.
+        if _GTP_PREFETCH_RULES_FROZEN:
+            raise RuntimeError(
+                "update_gtp_config(rs_hold_rules=...): the communication schedule is "
+                "already frozen (chains classified or cache tickets reserved). Set "
+                "GTP_RS_HOLD / rs_hold_rules before model init / first forward."
+            )
+        kwargs["rs_hold_rules"] = _validate_rs_hold_rules(kwargs["rs_hold_rules"])
     if "prefetch_steps_rules" in kwargs:
         # The prefetch schedule must be frozen before chains are classified / the
         # first cache ticket is reserved (CUDA-graph capture replays a static op
@@ -883,6 +1145,14 @@ def _init_gtp_runtime_attrs(obj):
     obj._wgrad_rs_handle = None
     obj.rs_event = torch.cuda.Event(external=True)
     obj._rs_ticket = None
+    # Published after a deferred RS-stream main_grad accumulation. DDP waits
+    # this event on whichever stream ultimately completes the owning bucket.
+    obj._gtp_main_grad_ready_event = None
+    # RS hold/flush: plan-stamped hold depth (classify_gtp_chains) and the
+    # parked-RS record {"wgrads", "nvtx_label", "remaining"} while held.
+    # nvtx_label is preserved so a flushed RS emits the identical .gtp_rs range.
+    obj.rs_hold_steps = 0
+    obj._held_rs = None
     # Padding
     obj.pad_length = 0
     # Debug
@@ -1634,6 +1904,19 @@ class GTPShardedParam(torch.nn.Parameter):
         return dummy_grad
 
     def _wait_reduce_scatter(self, finalize_grad=False):
+        # A held (parked, never-issued) RS MUST be flushed before any wait: the
+        # cascade finalize below reads the RS output tickets and accumulating an
+        # unissued ticket would corrupt main_grad with stale buffer contents.
+        if self._held_rs is not None:
+            self._flush_held_rs()
+        # Dequeue from the deferred-finalize FIFO (identity-based; tensor __eq__
+        # is elementwise) — whoever waits finalizes; the tick must not re-wait.
+        fqueue = _rs_finalize_queues.get(self.chain_id)
+        if fqueue:
+            for i, e in enumerate(fqueue):
+                if e[0] is self:
+                    del fqueue[i]
+                    break
         # Enter rs_stream context so handle.wait() + rs_event.record() land on rs_stream
         # (mirrors _wait_param_gather). With finalize_grad=True, main_grad.add_ also runs on
         # rs_stream right after the NCCL RS — starts during AG drain, not after, avoiding
@@ -1642,17 +1925,51 @@ class GTPShardedParam(torch.nn.Parameter):
         if rs_stream is None:
             rs_stream = get_rs_stream(self.chain_id, self.group)
             self._cached_rs_stream = rs_stream
+        compute_stream = torch.cuda.current_stream()
         with torch.cuda.stream(rs_stream):
             if self._wgrad_rs_handle is not None:
                 self._wgrad_rs_handle.wait()
                 self._wgrad_rs_handle = None
                 self.rs_event.record()
+                if finalize_grad and _RS_HOLDS_ENABLED:
+                    # The main_grad.add_ below runs on rs_stream; the chain-tail
+                    # drain must order it before compute-stream main_grad
+                    # readers (grad norm / optimizer) — register for the barrier.
+                    _rs_finalize_streams.setdefault(self.chain_id, set()).add(rs_stream)
                 if finalize_grad:
                     cache = get_global_GTP_cache()
                     for w in self._weights:
                         wgrad_rs = cache.get(w._rs_ticket)
                         w.main_grad.add_(wgrad_rs)
                         cache.release(w._rs_ticket)
+                    if _RS_HOLDS_ENABLED:
+                        # A later non-held sibling can complete the DDP bucket on
+                        # another stream. Publish the completion of every add so
+                        # BucketGroup.start_grad_sync can establish the dependency
+                        # on the stream that actually reads this bucket. The chain-
+                        # tail stream barrier remains necessary for optimizer-side
+                        # readers when no bucket launch consumes this event first.
+                        main_grad_ready_event = self._gtp_main_grad_ready_event
+                        if main_grad_ready_event is None:
+                            main_grad_ready_event = torch.cuda.Event(external=True)
+                            self._gtp_main_grad_ready_event = main_grad_ready_event
+                        main_grad_ready_event.record(rs_stream)
+                        for w in self._weights:
+                            w._gtp_main_grad_ready_event = main_grad_ready_event
+                        # Re-establish compute-stream ordering after the rs_stream
+                        # adds BEFORE grad-ready fires or buffers recycle. The
+                        # ready-event only fences DDP bucket readers; two other
+                        # consumer classes rely on the compute stream being past
+                        # the RS (v1's cascade rs_event.wait gave this for free):
+                        #   1. the wgrad-input pool — a later wgrad GEMM (compute
+                        #      stream) can overwrite a pooled buffer the in-flight
+                        #      RS is still reading (proven: non-reproducible inf
+                        #      in the bucket-0 grad norm, jobs 1716509/1730546);
+                        #   2. the ticket cache — the next reserver's AG orders
+                        #      itself against the COMPUTE stream at issue, never
+                        #      against these rs_stream adds.
+                        # Stall is ~0: the RS had rs_finalize_lag sites to finish.
+                        compute_stream.wait_stream(rs_stream)
                     # Fire grad-ready AFTER all adds (separate loop so a bucket-completing
                     # grad-ready can't dispatch the RS before a sibling's add). With autograd
                     # grad-ready suppressed for GTP params (DDP register_grad_accum_hook), this
@@ -1681,9 +1998,17 @@ class GTPShardedParam(torch.nn.Parameter):
         if gtp_remat_size > 1 and not GTP_CONFIG.calculate_per_token_loss:
             torch._foreach_mul_(list(wgrads), 1.0 / gtp_remat_size)
 
-    def _reduce_scatter(self, wgrads, async_op, nvtx_label=None):
+    def _reduce_scatter(self, wgrads, async_op, nvtx_label=None,
+                        outer_event_prerecorded=False):
         """Reduce-scatter one or more wgrads → (outputs, handle). Single tensor: plain RS;
-        multiple: coalesced RS."""
+        multiple: coalesced RS.
+
+        outer_event_prerecorded: the wgrad-writer sync event was already recorded
+        (at RS-hold PARK time — the true data dependency). Recording a FRESH event
+        here would make rs_stream wait for everything the compute stream enqueued
+        since (the NEXT weight's dgrad/wgrad) — a false dependency that serializes
+        a flushed RS behind unrelated compute (measured: held RSs started only
+        after the next wgrad's END even with the lane free)."""
         if nvtx_label is None:
             nvtx_label = self._debug_name + ".bwd" + (".async" if async_op else ".sync")
 
@@ -1720,7 +2045,8 @@ class GTPShardedParam(torch.nn.Parameter):
             if getattr(self, "_rs_outer_sync_event", None) is None:
                 self._rs_outer_sync_event = torch.cuda.Event()
             outer_sync_event = self._rs_outer_sync_event
-            outer_sync_event.record(outer_stream)
+            if not outer_event_prerecorded:
+                outer_sync_event.record(outer_stream)
             rs_stream.wait_event(outer_sync_event)
             rs_ctx = torch.cuda.stream(rs_stream)
         else:
@@ -1747,6 +2073,64 @@ class GTPShardedParam(torch.nn.Parameter):
 
             return outputs, cm if async_op else None
 
+    def _park_held_rs(self, wgrads, nvtx_label):
+        """Park this weight's wgrad RS instead of issuing it (rs_hold_steps > 0).
+
+        The record keeps the wgrad input buffers alive (invariant: they are only
+        pool-recycled after the RS is waited) and the nvtx label so the flushed
+        collective is indistinguishable from an at-site issue in the profile.
+
+        The wgrad-writer sync event is recorded NOW — parking time is when the
+        true data dependency (this weight's own wgrad GEMM) sits on the compute
+        stream. The flush reuses it (outer_event_prerecorded), so the flushed RS
+        can start the moment the comm lane frees instead of after everything the
+        compute stream enqueued since (the false dependency that serialized
+        held RSs behind the next weight's wgrad).
+        """
+        assert self._held_rs is None and self._wgrad_rs_handle is None, (
+            f"[GTP] {self._debug_name}: parking an RS while one is already "
+            "held/in-flight — RS-site skipped without drain?"
+        )
+        if getattr(self, "_rs_outer_sync_event", None) is None:
+            self._rs_outer_sync_event = torch.cuda.Event()
+        self._rs_outer_sync_event.record(torch.cuda.current_stream())
+        self._held_rs = {
+            "wgrads": wgrads,
+            "nvtx_label": nvtx_label,
+            "remaining": self.rs_hold_steps,
+        }
+        _held_rs_queues.setdefault(self.chain_id, []).append(self)
+
+    def _flush_held_rs(self):
+        """Issue a parked RS (idempotent). Replicates the at-site async issue;
+        must run on the caller's compute stream (never inside an rs_stream
+        context). Uses the park-time sync event (see _park_held_rs) so the
+        collective's only upstream edge is the held weight's own wgrad."""
+        rec = self._held_rs
+        if rec is None:
+            return
+        self._held_rs = None
+        queue = _held_rs_queues.get(self.chain_id)
+        if queue is not None:
+            # identity-based removal: tensor __eq__ is elementwise
+            for i, q in enumerate(queue):
+                if q is self:
+                    del queue[i]
+                    break
+        # BISECT: outer_event_prerecorded=True (the park-time event) is
+        # temporarily disabled — three runs with it hit an all-rank
+        # cudaErrorInvalidValue; re-recording at flush (v1 semantics) while
+        # keeping the deferred finalize isolates which change is at fault.
+        _, rs_handle = self._reduce_scatter(
+            rec["wgrads"], async_op=True, nvtx_label=rec["nvtx_label"],
+        )
+        self._wgrad_rs_handle = GTPShardHandle(rs_handle, self._weights, reduce_scatter=True)
+        self._wgrad_input_bufs = rec["wgrads"]
+        # Deferred finalize: the next site's cascade skips held weights; this
+        # entry ages one per RS-site and is finalized after rs_finalize_lag
+        # sites (_rs_finalize_tick) or at the chain-tail drain.
+        _rs_finalize_queues.setdefault(self.chain_id, []).append([self, 0])
+
     def wgrad_reduce_scatter(self, wgrad, nvtx_label=None):
         """Reduce-scatter wgrad(s): sync for the last weight, async+deferred for others.
         Accepts a single tensor (non-routed) or a list (routed experts).
@@ -1763,14 +2147,40 @@ class GTPShardedParam(torch.nn.Parameter):
         # cannot, since CUDA graphs require stable buffer addresses across replay.
         poolable = self.chain_id == GTPChain.UNGRAPHED.value
 
+        if _RS_HOLDS_ENABLED:
+            # Self-stale backstop: our own previous RS still parked at our next
+            # RS-site means an RS-site was skipped without a drain in between.
+            # Unreachable in the normal walk; fail safe by flushing + waiting.
+            if self._held_rs is not None:
+                logger.warning(
+                    "[GTP] %s: previous held RS still parked at its own next "
+                    "RS-site — flushing (was a backward truncated without "
+                    "wait_async_comms?)", self._debug_name,
+                )
+                self._flush_held_rs()
+                self._wait_reduce_scatter(finalize_grad=True)
+            # Tick: entry of an RS-site is strictly after this weight's backward
+            # AG issue (dgrad start), so a flush here lands the held RS behind
+            # that AG on the NCCL queue. FIFO; flush every entry reaching 0.
+            _rs_hold_tick(self.chain_id)
+
         if GTP_CONFIG.async_reduction and self.prev_w is not None:
-            # Async RS (not last weight — deferred finish). Pre-RS work on caller; NCCL wrap
-            # lives at the collective site inside _reduce_scatter (mirrors the AG prefetch sites).
-            _, rs_handle = self._reduce_scatter(wgrads, async_op=True, nvtx_label=nvtx_label)
-            self._wgrad_rs_handle = GTPShardHandle(rs_handle, weights, reduce_scatter=True)
-            # Stash wgrad input buffers — cannot recycle yet because the async RS
-            # kernel is still reading them on rs_stream.
-            self._wgrad_input_bufs = wgrads
+            if (
+                _RS_HOLDS_ENABLED
+                and self.rs_hold_steps > 0
+                and self.chain_id == GTPChain.UNGRAPHED.value
+            ):
+                # Plan-driven hold: park instead of issue (flushed by the tick
+                # above at a later RS-site, or force-flushed at finalize/drain).
+                self._park_held_rs(wgrads, nvtx_label)
+            else:
+                # Async RS (not last weight — deferred finish). Pre-RS work on caller; NCCL wrap
+                # lives at the collective site inside _reduce_scatter (mirrors the AG prefetch sites).
+                _, rs_handle = self._reduce_scatter(wgrads, async_op=True, nvtx_label=nvtx_label)
+                self._wgrad_rs_handle = GTPShardHandle(rs_handle, weights, reduce_scatter=True)
+                # Stash wgrad input buffers — cannot recycle yet because the async RS
+                # kernel is still reading them on rs_stream.
+                self._wgrad_input_bufs = wgrads
             ret = tuple([None] * len(wgrads)) if batched else None
         else:
             # Sync reduce-scatter — reached as the natural chain-head case, recycle immediately
@@ -1791,25 +2201,39 @@ class GTPShardedParam(torch.nn.Parameter):
         # Wait for last reduce scatter if it was async
         # Currently only support reduce scattering in reverse order
         if GTP_CONFIG.async_reduction and self.next_w is not None:
-            self.next_w._wait_reduce_scatter()
-
-            if getattr(self.next_w, "_already_finalized", False):
-                self.next_w._already_finalized = False
+            if _RS_HOLDS_ENABLED and self.next_w.rs_hold_steps > 0:
+                # Held weight: the next-site wait here is exactly the checkpoint
+                # that serialized held RSs. Skip it — finalization is deferred
+                # to _rs_finalize_tick (lag sites later) / the chain-tail drain.
+                pass
             else:
-                self.next_w.rs_event.wait()
-                cache = get_global_GTP_cache()
-                next_weights = self.next_w._weights
-                wgrads = [cache.get(w._rs_ticket) for w in next_weights]
-                nvtx_range_push(f"{self.next_w._debug_name}.gtp_wgrad_accum_deferred")
-                # Only batch with _foreach_add_ when finalizing multiple (routed) weights.
-                if len(next_weights) == 1:
-                    next_weights[0].main_grad.add_(wgrads[0])
+                self.next_w._wait_reduce_scatter()
+
+                if getattr(self.next_w, "_already_finalized", False):
+                    self.next_w._already_finalized = False
                 else:
-                    torch._foreach_add_([w.main_grad for w in next_weights], wgrads)
-                nvtx_range_pop(f"{self.next_w._debug_name}.gtp_wgrad_accum_deferred")
-                for w in next_weights:
-                    self._handle_megatron_grad_accum(w)
-                    cache.release(w._rs_ticket)
+                    self.next_w.rs_event.wait()
+                    cache = get_global_GTP_cache()
+                    next_weights = self.next_w._weights
+                    wgrads = [cache.get(w._rs_ticket) for w in next_weights]
+                    nvtx_range_push(f"{self.next_w._debug_name}.gtp_wgrad_accum_deferred")
+                    # Only batch with _foreach_add_ when finalizing multiple (routed) weights.
+                    if len(next_weights) == 1:
+                        next_weights[0].main_grad.add_(wgrads[0])
+                    else:
+                        torch._foreach_add_([w.main_grad for w in next_weights], wgrads)
+                    nvtx_range_pop(f"{self.next_w._debug_name}.gtp_wgrad_accum_deferred")
+                    for w in next_weights:
+                        self._handle_megatron_grad_accum(w)
+                        cache.release(w._rs_ticket)
+
+        if _RS_HOLDS_ENABLED:
+            # Deferred finalize of flushed-held RSs (lag sites of GPU overlap),
+            # then the chain-tail drain at the LAST backward RS-site (chain
+            # head) — eager mode's only end-of-backward hook.
+            _rs_finalize_tick(self.chain_id)
+            if self.prev_w is None:
+                _rs_drain_chain(self.chain_id)
 
         return ret
 
@@ -2091,6 +2515,19 @@ def wait_async_comms(
         * _already_ag_drained = True   (if an AG handle was drained)
         * _already_finalized  = True   (if finalize_after_drain=True)
     """
+    # Flush any still-held RSs BEFORE the in-flight snapshot below: a parked
+    # param has no live handle yet, so flushing here both registers its handle
+    # and makes the per-param drain below wait/finalize it. skip_rs callers
+    # (GRAPHED-chain sites) leave holds parked — GRAPHED queues are empty by
+    # construction (v1 is eager-only).
+    if not skip_rs and _RS_HOLDS_ENABLED:
+        for cid, queue in list(_held_rs_queues.items()):
+            if chain_id is not None and cid != chain_id:
+                continue
+            for param in list(queue):
+                # GTPShardHandle registers the param in _inflight_comm_params,
+                # so the drain loop below waits + finalizes it normally.
+                param._flush_held_rs()
     for param in list(_inflight_comm_params):
         if (
             chain_id is not None
@@ -2234,8 +2671,13 @@ def reset_gtp_state():
     inherit stale last_weight pointers / flushed link tables. Call once before the per-chunk
     classify_gtp_chains loop (never inside it — chains span chunks). No-op on a fresh process.
     """
+    global _RS_HOLDS_ENABLED
     GTPShardedParam._chain_state.clear()
     GTPShardedParam._recompute_chain_state.clear()
+    _held_rs_queues.clear()
+    _rs_finalize_queues.clear()
+    _rs_finalize_streams.clear()
+    _RS_HOLDS_ENABLED = False
 
 
 # ------------------------------------------------------------------------

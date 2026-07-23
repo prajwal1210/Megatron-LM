@@ -380,21 +380,34 @@ def _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks, s
                 # {"gtp_fetch_steps": "<substr>:<next>:<prev>,...", ...}. Every rank
                 # must be given the same file (the schedule is part of the program).
                 # An explicit GTP_FETCH_STEPS overrides the plan.
+                # Load the plan artifact once; each key is consulted only when its
+                # explicit env override is absent (env wins per-key).
                 _fetch_steps_env = os.environ.get("GTP_FETCH_STEPS", "").strip()
+                _rs_hold_env = os.environ.get("GTP_RS_HOLD", "").strip()
                 _plan_path = os.environ.get("GTP_COMM_PLAN", "").strip()
-                if _plan_path and not _fetch_steps_env:
+                _plan_doc = {}
+                if _plan_path and not (_fetch_steps_env and _rs_hold_env):
                     import json as _json
 
                     with open(_plan_path) as _f:
-                        _fetch_steps_env = str(
-                            _json.load(_f).get("gtp_fetch_steps", "")
-                        ).strip()
+                        _plan_doc = _json.load(_f)
+                if _plan_path and not _fetch_steps_env:
+                    _fetch_steps_env = str(_plan_doc.get("gtp_fetch_steps", "")).strip()
                     print_rank_0(
                         f"> GTP communication plan {_plan_path!r}: "
                         + ("applying lowered fetch-steps"
                            if _fetch_steps_env else
                            "no non-default rules (runtime default realizes the plan)")
                     )
+                # RS hold/flush: absent key => empty => no holds (old artifacts stay
+                # compatible; the runtime default is byte-identical).
+                if _plan_path and not _rs_hold_env:
+                    _rs_hold_env = str(_plan_doc.get("gtp_rs_hold", "")).strip()
+                    if _rs_hold_env:
+                        print_rank_0(
+                            f"> GTP communication plan {_plan_path!r}: applying "
+                            "lowered rs-hold rules"
+                        )
                 if _fetch_steps_env:
                     from megatron.core.tensor_parallel.generalized_tensor_parallelism import (
                         update_gtp_config,
@@ -415,6 +428,26 @@ def _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks, s
                         _rules.append((_substr.strip(), int(_next_s), int(_prev_s)))
                     update_gtp_config(prefetch_steps_rules=_rules)
                     print_rank_0(f"> GTP per-type prefetch lookahead rules: {_rules}")
+                if _rs_hold_env:
+                    from megatron.core.tensor_parallel.generalized_tensor_parallelism import (
+                        update_gtp_config,
+                    )
+
+                    _rs_rules = []
+                    for _entry in _rs_hold_env.split(","):
+                        _entry = _entry.strip()
+                        if not _entry:
+                            continue
+                        _parts = _entry.split(":")
+                        if len(_parts) != 2:
+                            raise ValueError(
+                                f"GTP_RS_HOLD entry {_entry!r} is malformed; expected "
+                                "'<substr>:<hold_steps>'."
+                            )
+                        _substr, _hold_s = _parts
+                        _rs_rules.append((_substr.strip(), int(_hold_s)))
+                    update_gtp_config(rs_hold_rules=_rs_rules)
+                    print_rank_0(f"> GTP per-type wgrad RS hold rules: {_rs_rules}")
             mpu.initialize_model_parallel(
                 args.tensor_model_parallel_size,
                 args.pipeline_model_parallel_size,
