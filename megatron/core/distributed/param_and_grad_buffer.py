@@ -308,6 +308,21 @@ class _ParamAndGradBucketGroup:
         if len(quantized_params) > 0:
             post_all_gather_processing(quantized_params)
 
+    def _wait_for_main_grad_ready_events(self):
+        """Order this stream after asynchronous main_grad producers."""
+        current_stream = torch.cuda.current_stream()
+        waited_event_ids = set()
+        for bucket in self.buckets:
+            for param in bucket.params_list:
+                for event_attr in (
+                    "_cudagraph_wgrad_ready_event",
+                    "_gtp_main_grad_ready_event",
+                ):
+                    event = getattr(param, event_attr, None)
+                    if event is not None and id(event) not in waited_event_ids:
+                        current_stream.wait_event(event)
+                        waited_event_ids.add(id(event))
+
     def check_grads(self, check_for_nan_or_inf, check_for_large):
         """
         Make sure norm of grads in bucket are not NaN prior to data-parallel
@@ -586,17 +601,10 @@ class _ParamAndGradBucketGroup:
             self.grad_reduce_handle is None
         ), "Should not have multiple communication calls outstanding at once"
 
-        # Local CUDA graph replay is asynchronous with respect to the outer
-        # autograd hooks. Wait before reading, scaling, or reducing gradients
-        # accumulated by a replay into this bucket.
-        current_stream = torch.cuda.current_stream()
-        waited_event_ids = set()
-        for bucket in self.buckets:
-            for param in bucket.params_list:
-                event = getattr(param, "_cudagraph_wgrad_ready_event", None)
-                if event is not None and id(event) not in waited_event_ids:
-                    current_stream.wait_event(event)
-                    waited_event_ids.add(id(event))
+        # CUDA graph replay and deferred GTP RS finalization can both write
+        # main_grad asynchronously with respect to the hook that completes this
+        # bucket. Wait before reading, scaling, or reducing its gradients.
+        self._wait_for_main_grad_ready_events()
 
         # Copy accumulated .main_grad into communication buffer before collective if
         # .main_grad is not in .grad_data already (e.g., because we want to do local

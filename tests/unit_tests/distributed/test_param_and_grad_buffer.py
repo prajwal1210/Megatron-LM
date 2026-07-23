@@ -10,7 +10,11 @@ import torch
 
 from megatron.core import parallel_state
 from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
-from megatron.core.distributed.param_and_grad_buffer import _ParamAndGradBuffer, partition_buckets
+from megatron.core.distributed.param_and_grad_buffer import (
+    _ParamAndGradBuffer,
+    _ParamAndGradBucketGroup,
+    partition_buckets,
+)
 from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
 from megatron.core.transformer import TransformerConfig
 from tests.unit_tests.test_utilities import TestModel, Utils
@@ -96,6 +100,29 @@ def get_model_and_buffers(
     bucket_groups = model.bucket_groups
 
     return model, param_and_grad_buffer, bucket_groups
+
+
+def test_main_grad_ready_events_waited_once_per_bucket_launch():
+    """DDP waits every async producer event and deduplicates shared events."""
+    cudagraph_event = object()
+    gtp_event = object()
+    first_param = torch.nn.Parameter(torch.zeros(1))
+    second_param = torch.nn.Parameter(torch.zeros(1))
+    first_param._cudagraph_wgrad_ready_event = cudagraph_event
+    first_param._gtp_main_grad_ready_event = gtp_event
+    second_param._gtp_main_grad_ready_event = gtp_event
+
+    bucket_group = object.__new__(_ParamAndGradBucketGroup)
+    bucket_group.buckets = [mock.Mock(params_list=[first_param, second_param])]
+    current_stream = mock.Mock()
+
+    with mock.patch("torch.cuda.current_stream", return_value=current_stream):
+        bucket_group._wait_for_main_grad_ready_events()
+
+    assert current_stream.wait_event.call_args_list == [
+        mock.call(cudagraph_event),
+        mock.call(gtp_event),
+    ]
 
 
 @pytest.mark.parametrize("bucket_size", [None, 9000, 9025, 9050, 18000, 18050, 20000])
