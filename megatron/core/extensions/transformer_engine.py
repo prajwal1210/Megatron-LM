@@ -454,7 +454,7 @@ def _gtp_pre_init(
     return shard_out, gtp_ctx
 
 
-def _gtp_attach_post_init(module, gtp_ctx, is_grouped=False):
+def _gtp_attach_post_init(module, gtp_ctx, is_grouped=False, is_expert=False):
     """Attach the GTP surface to a pre-sharded TE module's weights and restore logical out_features.
 
     ``is_grouped=True`` for GroupedLinear (per-expert weight0..N, coalesced AG via weight_list).
@@ -466,7 +466,9 @@ def _gtp_attach_post_init(module, gtp_ctx, is_grouped=False):
     # super().__init__): downstream code reads it, e.g. the grouped-MLP fusion gate checks
     # fc1.out_features == 2 * fc2.in_features (a shard-sized fc1 would silently disable fusion).
     module.out_features = logical_out_features
-    attach_gtp_to_presharded_module(module, gtp_remat_group, pad_length, is_grouped=is_grouped)
+    attach_gtp_to_presharded_module(
+        module, gtp_remat_group, pad_length, is_grouped=is_grouped, is_expert=is_expert
+    )
 
 
 @contextmanager
@@ -498,8 +500,19 @@ def _init_gtp_remat_context(
         rng_via_kwarg=rng_via_kwarg,
         out_split_size=out_split_size,
     )
-    yield out_features
-    _gtp_attach_post_init(module, gtp_ctx, is_grouped=is_grouped)
+    # Route super().__init__'s pre-sharded weight (native FP8/MXFP8 storage under
+    # --fp8-param-gather) into the registered symmetric pool -> NVLS-eligible GTP all-gather input.
+    # TODO: narrow this wrap (it also captures the high-precision init weight, biases, and FP8
+    # meta buffers). TE's replace_raw_data cannot re-home MXFP8 data+scales yet; when it can, or
+    # via meta-device init + a wrapped reset_parameters(), only the quantized storage needs this.
+    from megatron.core.tensor_parallel.gtp_api import gtp_symm_pool_ctx, is_gtp_symm_pool_registered
+
+    if is_gtp_symm_pool_registered(gtp_remat_group):
+        with gtp_symm_pool_ctx(gtp_remat_group):
+            yield out_features
+    else:
+        yield out_features
+    _gtp_attach_post_init(module, gtp_ctx, is_grouped=is_grouped, is_expert=is_expert)
 
 
 def split_te_layernorm_column_parallel_linear(
@@ -1477,6 +1490,7 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
             output_size,
             gtp_remat_group,
             extra_kwargs,
+            is_expert=is_expert,
             rng_via_kwarg=False,
             out_split_size=self.tp_size,
         )

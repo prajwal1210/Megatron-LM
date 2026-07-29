@@ -2183,6 +2183,11 @@ def setup_model_and_optimizer(
             reduce_scatter_with_fp32_accumulation=getattr(
                 args, 'gtp_remat_reduce_scatter_with_fp32_accumulation', False
             ),
+            gtp_nccl_ub=getattr(args, 'gtp_nccl_ub', False),
+            egtp_nccl_ub=getattr(args, 'egtp_nccl_ub', False),
+            # TODO: This needs to be removed as DDP should not be aware of the DDP param
+            use_distributed_optimizer=getattr(args, 'use_distributed_optimizer', False),
+            pg_collection=pg_collection,
         )
 
     model = _build_model_wrapper(wrap_with_ddp)
@@ -2200,6 +2205,15 @@ def setup_model_and_optimizer(
             moe_shared_expert_overlap=getattr(args, 'moe_shared_expert_overlap', False),
             cuda_graph_impl=getattr(args, 'cuda_graph_impl', 'none'),
         )
+
+        if getattr(args, 'gtp_nccl_ub', False) or getattr(args, 'egtp_nccl_ub', False):
+            from megatron.core.tensor_parallel.gtp_api import register_ddp_buffers_on_gtp_groups
+
+            # Register DDP param buffers on GTP comm groups so the input to 
+            # GTP all-gather (BF16 case) are in the NCCL symmetric window.
+            for model_chunk in model:
+                if isinstance(model_chunk, DDP):
+                    register_ddp_buffers_on_gtp_groups(model_chunk)
 
     if args.logits_save_dir is not None and mpu.is_pipeline_last_stage():
         from megatron.training.distillation import LogitsSaverHooks
@@ -4255,10 +4269,28 @@ def train(
         # ncclCommDeregister on handles created by ncclCommWindowRegister,
         # causing "NCCL WARN Deregister: Could not find handle" and a crash.
         torch.distributed.barrier()
+        if is_gtp_remat_active(args) and (
+            getattr(args, 'gtp_nccl_ub', False) or getattr(args, 'egtp_nccl_ub', False)
+        ):
+            from megatron.core.tensor_parallel.gtp_api import (
+                deregister_ddp_buffers_from_gtp_groups,
+                deregister_gtp_symm_pools,
+            )
+
+            # Deregister the DDP param buffer from the GTP comm groups
+            for model_module in model:
+                if isinstance(model_module, DDP):
+                    deregister_ddp_buffers_from_gtp_groups(model_module)
+
+            # Deregister the GTP-remat pools
+            deregister_gtp_symm_pools()
+
+        # Deregister the DP-group registration only when --use-nccl-ub is enabled. 
+        # If some other module requested nccl_mem_pool, it will have to be deregistered in that module.
         for model_module in model:
             if isinstance(model_module, DDP):
                 for buf in model_module.buffers + model_module.expert_parallel_buffers:
-                    if getattr(buf, 'nccl_mem_pool', None) is not None:
+                    if getattr(buf, 'nccl_ub', False) and getattr(buf, 'nccl_mem_pool', None) is not None:
                         nccl_allocator.deregister_mem_pool(buf.nccl_mem_pool, buf.data_parallel_group)
         one_logger and one_logger.log_metrics(
             {'app_finish_time': one_logger_utils.get_timestamp_in_ms()}

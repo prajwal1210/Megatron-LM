@@ -319,7 +319,7 @@ class VocabParallelEmbedding(torch.nn.Module):
         if gtp_remat_group is not None and gtp_remat_group.size() > 1:
             from megatron.core.tensor_parallel.gtp_api import wrap_module_params_gtp
 
-            wrap_module_params_gtp(self, ["weight"], gtp_remat_group)
+            wrap_module_params_gtp(self, ["weight"], gtp_remat_group, is_expert=False)
             self.gtp_remat_size = gtp_remat_group.size()
             # Nothing prefetches embedding — it is head of the UNGRAPHED
             # chain in fwd, and its bwd bypasses all_gather_and_prefetch_bwd
@@ -1070,7 +1070,7 @@ class ColumnParallelLinear(torch.nn.Module):
         if gtp_remat_group is not None and gtp_remat_group.size() > 1:
             from megatron.core.tensor_parallel.gtp_api import wrap_module_params_gtp
 
-            wrap_module_params_gtp(self, ["weight"], gtp_remat_group)
+            wrap_module_params_gtp(self, ["weight"], gtp_remat_group, is_expert=self.is_expert)
             self.gtp_remat_size = gtp_remat_group.size()
 
         if bias:
@@ -1434,7 +1434,7 @@ class RowParallelLinear(torch.nn.Module):
         if gtp_remat_group is not None and gtp_remat_group.size() > 1:
             from megatron.core.tensor_parallel.gtp_api import wrap_module_params_gtp
 
-            wrap_module_params_gtp(self, ["weight"], gtp_remat_group)
+            wrap_module_params_gtp(self, ["weight"], gtp_remat_group, is_expert=self.is_expert)
             self.gtp_remat_size = gtp_remat_group.size()
 
         if bias:

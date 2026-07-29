@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import logging
 from collections import defaultdict
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
 from typing import Callable, Iterable, Optional
 
@@ -155,6 +155,18 @@ def allocate_graph_wgrad_rings(
             )
             params_by_key[key].append(param)
 
+    # Symm-RS: GRAPHED chains send their persistent ring slot directly, so allocating the
+    # slot from the window-registered pool puts the RS send side in the NCCL symmetric
+    # window (the RS output ticket already is). This runs pre-capture and the pool routing
+    # is collective-free, so it is capture-safe; slot addresses stay stable either way.
+    # Skipped when fp32-accum turns the RS into an all-to-all NVLS cannot accelerate.
+    # Local imports: generalized_tensor_parallelism imports this module (circular).
+    from megatron.core.tensor_parallel.generalized_tensor_parallelism import GTP_CONFIG
+    from megatron.core.tensor_parallel.gtp_symmetric_memory import (
+        gtp_symm_pool_ctx,
+        is_gtp_symm_pool_registered,
+    )
+
     total_bytes = 0
     buffer_count = 0
     new_slots = []
@@ -162,13 +174,22 @@ def allocate_graph_wgrad_rings(
         slot_count = min(ring_size, len(matching_params))
         slots = []
         exemplar = matching_params[0]
+        fp32_accum_a2a = (
+            GTP_CONFIG.reduce_scatter_with_fp32_accumulation and exemplar.group.size() > 2
+        )
+        symm = (
+            getattr(exemplar, "gtp_smr", False)
+            and not fp32_accum_a2a
+            and is_gtp_symm_pool_registered(exemplar.group)
+        )
         for slot_index in range(slot_count):
-            tensor = torch.empty(
-                exemplar._unsharded_shape_padded,
-                dtype=exemplar.main_grad.dtype,
-                device=exemplar.device,
-                memory_format=torch.contiguous_format,
-            )
+            with gtp_symm_pool_ctx(exemplar.group) if symm else nullcontext():
+                tensor = torch.empty(
+                    exemplar._unsharded_shape_padded,
+                    dtype=exemplar.main_grad.dtype,
+                    device=exemplar.device,
+                    memory_format=torch.contiguous_format,
+                )
             if exemplar.pad_length > 0:
                 tensor.narrow(0, exemplar._unsharded_shape[0], exemplar.pad_length).zero_()
             slot = GraphWgradRingSlot(

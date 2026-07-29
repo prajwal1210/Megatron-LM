@@ -9,6 +9,17 @@ too old the core module imports cleanly but reports ``HAVE_TE = False``, mirrore
 module uses GTP symbols without TE.
 """
 
+# Symmetric-memory helpers, outside the HAVE_TE guard on purpose: gtp_symmetric_memory has
+# no TE dependency, and shutdown must be able to deregister pools even where the TE-backed
+# surface is unavailable.
+from megatron.core.tensor_parallel.gtp_symmetric_memory import (
+    deregister_ddp_buffers_from_gtp_groups,
+    deregister_gtp_symm_pools,
+    gtp_symm_pool_ctx,
+    is_gtp_symm_pool_registered,
+    register_ddp_buffers_on_gtp_groups,
+)
+
 try:
     from megatron.core.tensor_parallel.generalized_tensor_parallelism import (
         GTP_CONFIG,
@@ -45,6 +56,11 @@ except ImportError:
 __all__ = [
     "HAVE_GTP",
     "GTP_CONFIG",
+    "register_ddp_buffers_on_gtp_groups",
+    "deregister_ddp_buffers_from_gtp_groups",
+    "gtp_symm_pool_ctx",
+    "is_gtp_symm_pool_registered",
+    "deregister_gtp_symm_pools",
     "GTPChain",
     "GTPEmbeddingWeight",
     "attach_gtp_to_presharded_module",
